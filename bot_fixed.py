@@ -157,8 +157,8 @@ def make_category_view() -> discord.ui.View:
             super().__init__(placeholder="اختر قسم الأغاني 🎶", options=options)
 
         async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=False)
-            results = await search(CATEGORIES[self.values[0]])
+                        await interaction.response.defer(ephemeral=False)
+           spaces results = await search(CATEGORIES[self.values[0]])
             if not results:
                 return await interaction.followup.send("ما لقيت شي 😔", ephemeral=True)
             await interaction.followup.send(
