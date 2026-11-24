@@ -1,5 +1,0 @@
-py-cord[voice]
-yt-dlp
-PyNaCl
-aiohttp
-openai
