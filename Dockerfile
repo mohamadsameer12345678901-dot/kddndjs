@@ -6,4 +6,4 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY . .
 
-CMD ["python", "bot_fixed.py"]
+CMD ["python", "bot_v2.py"]
