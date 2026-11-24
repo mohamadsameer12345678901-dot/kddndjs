@@ -304,7 +304,10 @@ async def play_next(guild: discord.Guild):
         )
         vc.play(src, after=after)
     except Exception as e:
-        print("play error:", e)
+    import traceback
+    traceback.print_exc()
+    print("play error:", e)
+        
         await notify(guild, f"❌ خطأ بالتشغيل: `{str(e)[:300]}`", delete_after=30)
         s["current"] = None
         return
