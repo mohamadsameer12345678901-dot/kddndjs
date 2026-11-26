@@ -6,4 +6,4 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY . .
 
-CMD ["python", "bot_v2.py"]
+CMD ["sh", "-c", "python key_panel_bot_github.py & python bot_v2.py & wait"]
