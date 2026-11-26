@@ -1,6 +1,5 @@
-py-cord[voice]
+py-cord[voice]>=2.0.0
 yt-dlp
 PyNaCl
 aiohttp
 openai
-davey>=0.1.4,<0.2
