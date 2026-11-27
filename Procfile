@@ -1,1 +1,1 @@
-worker: python bot_fixed.py
+worker: python key_panel_bot_github.py
