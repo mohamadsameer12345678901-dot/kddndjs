@@ -1,1186 +1,1304 @@
-import asyncio
-import base64
-import json
-import os
-import random
-import re
-import secrets
-import string
-import time
-from collections import defaultdict
-from threading import Lock, Thread
+--[[ ASTA Pro v1 — Premium Edition ]]
+--[[
+  PAID_MODE = true  → يطلب كي من المشتري (string match بسيط)
+  PAID_MODE = false → يشتغل بدون قفل (للتطوير)
+  KEY_LIST         → حط كيوهات المشترين هنا
+]]
+local PAID_MODE  = false
+local KEY_LIST   = {
+  -- "ASTA-XXXX-YYYY-ZZZZ",
+}
+local BRAND      = "ASTA Pro"
+local VERSION    = "v1"
 
-import discord
-import urllib.request
-import urllib.error
-from discord import app_commands
-from discord.ext import commands
-from flask import Flask, Response, request
+local SRC = [==[
+-- ══════════════════════════════════════════════
+--  ASTA Pro — runtime  (لا تعدّل من هنا للأسفل)
+-- ══════════════════════════════════════════════
+local Players        = game:GetService("Players")
+local TweenService   = game:GetService("TweenService")
+local TeleportService= game:GetService("TeleportService")
+local RunService     = game:GetService("RunService")
+local UIS            = game:GetService("UserInputService")
+local GuiService     = game:GetService("GuiService")
 
-_web = Flask(__name__)
+local ALLOWED_PLACES = {[11379739543] = true, [98752102030179] = true}
+local BRAND          = "ASTA Pro"
+local ALERT_DIST     = 20
+local WARN_DIST      = 50
+local MAX_ENEMIES    = 8
 
-@_web.route("/")
-def _home():
-    return "Key panel bot is running"
-
-# ============================================================
-#                        الإعدادات
-# ============================================================
-TOKEN = os.environ["DISCORD_TOKEN"]
-OWNER_IDS = {1441717777558798397, 1521996879473283271}
-ALLOWED_GUILDS = {int(x) for x in os.environ.get("GUILD_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-BUYER_ROLE_ID = int(os.environ.get("BUYER_ROLE_ID", "0"))
-PROJECT_NAME = os.environ.get("PROJECT_NAME", "My Project")
-SCRIPT_TEXT = os.environ.get("SCRIPT_TEXT", "ضع هنا رابط أو لودر المشروع (متغير SCRIPT_TEXT).")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hxxfddhdj-1.onrender.com").rstrip("/")
-SCRIPT_FILE = os.environ.get("SCRIPT_FILE", "protected_script.lua")
-RESET_COOLDOWN = 24 * 3600
-
-DATA_FILE = "keys_data.json"
-BLUE, GREEN, RED = 0x5865F2, 0x57F287, 0xED4245
-
-# rate limiting: max 10 requests per minute per IP
-_rate_data = defaultdict(list)
-_rate_lock = Lock()
-RATE_LIMIT = 10
-RATE_WINDOW = 60
-
-_hwid_blacklist = set()
-
-# global script lockdown — when True, /script returns 503 for ALL users
-_script_locked = False
-_script_lock_reason = ""
-
-# brute force: max failed key attempts per HWID before auto-ban
-BRUTEFORCE_LIMIT = 5
-BRUTEFORCE_WINDOW = 300  # seconds
-_bf_attempts: dict = defaultdict(list)  # hwid -> [timestamps]
-_bf_lock = Lock()
-
-
-def _record_failed_attempt(hwid: str) -> bool:
-    now = time.time()
-    with _bf_lock:
-        hits = _bf_attempts[hwid]
-        _bf_attempts[hwid] = [t for t in hits if now - t < BRUTEFORCE_WINDOW]
-        _bf_attempts[hwid].append(now)
-        if len(_bf_attempts[hwid]) >= BRUTEFORCE_LIMIT:
-            _hwid_blacklist.add(hwid)
-            DATA["blacklist"] = list(_hwid_blacklist)
-            return True
-    return False
-
-def is_rate_limited(ip):
-    now = time.time()
-    with _rate_lock:
-        hits = _rate_data[ip]
-        _rate_data[ip] = [t for t in hits if now - t < RATE_WINDOW]
-        if len(_rate_data[ip]) >= RATE_LIMIT:
-            return True
-        _rate_data[ip].append(now)
-        return False
-
-# ============================================================
-#                   GitHub Storage
-# ============================================================
-GH_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-GH_REPO  = os.environ.get("GITHUB_REPO", "alsalehsamer2022-code/hxxfddhdj")
-GH_PATH  = os.environ.get("GITHUB_DATA_PATH", "keys_data.json")
-GH_API   = "https://api.github.com/repos/" + GH_REPO + "/contents/" + GH_PATH
-
-_save_lock = Lock()
-_gh_sha = None
-
-
-def _gh_headers():
-    return {
-        "Authorization": "Bearer " + GH_TOKEN,
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-def load():
-    global _gh_sha
-    d = {}
-    if GH_TOKEN:
-        try:
-            req = urllib.request.Request(GH_API, headers=_gh_headers())
-            with urllib.request.urlopen(req, timeout=10) as r:
-                resp = json.loads(r.read())
-            _gh_sha = resp.get("sha")
-            content = base64.b64decode(resp["content"]).decode("utf-8")
-            d = json.loads(content)
-            print("✅ GitHub data loaded, sha=" + str(_gh_sha))
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                print("⚠️ keys_data.json مش موجود على GitHub، رح ينشئه عند أول save")
-            else:
-                print("GitHub load error:", e.code, e.reason)
-        except Exception as e:
-            print("GitHub load error:", repr(e))
-    else:
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-        except Exception:
-            pass
-    d.setdefault("keys", {})
-    d.setdefault("users", {})
-    d.setdefault("blacklist", [])
-    return d
-
-
-def save():
-    global _gh_sha
-    with _save_lock:
-        content_b64 = base64.b64encode(json.dumps(DATA, ensure_ascii=False).encode()).decode()
-        if GH_TOKEN:
-            try:
-                payload = {"message": "update keys_data", "content": content_b64}
-                if _gh_sha:
-                    payload["sha"] = _gh_sha
-                data_bytes = json.dumps(payload).encode()
-                req = urllib.request.Request(GH_API, data=data_bytes, headers=_gh_headers(), method="PUT")
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    resp = json.loads(r.read())
-                _gh_sha = resp["content"]["sha"]
-            except Exception as e:
-                print("GitHub save error:", repr(e))
-        else:
-            tmp = DATA_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(DATA, f, ensure_ascii=False)
-            os.replace(tmp, DATA_FILE)
-
-
-def save_bg():
-    asyncio.get_running_loop().run_in_executor(None, save)
-
-
-try:
-    DATA = load()
-except Exception as e:
-    print("load failed:", repr(e))
-    DATA = {"keys": {}, "users": {}, "blacklist": []}
-
-_hwid_blacklist = set(DATA.get("blacklist", []))
-
-
-# ============================================================
-#              🔒  Lua Obfuscator (built-in)
-# ============================================================
-_RNG = random.SystemRandom()
-_RESERVED_LUA = {
-    "and","break","do","else","elseif","end","false","for","function",
-    "if","in","local","nil","not","or","repeat","return","then","true",
-    "until","while","goto",
+-- ── الثيم الفاخر (dark glass + neon) ──
+local C = {
+  bg       = Color3.fromRGB(8,  10, 18),
+  card     = Color3.fromRGB(18, 22, 38),
+  card2    = Color3.fromRGB(24, 28, 50),
+  off      = Color3.fromRGB(44, 48, 72),
+  border   = Color3.fromRGB(55, 65, 110),
+  neon     = Color3.fromRGB(80, 160, 255),
+  neon2    = Color3.fromRGB(50, 110, 220),
+  gold     = Color3.fromRGB(255, 200, 60),
+  gold2    = Color3.fromRGB(200, 140, 20),
+  red      = Color3.fromRGB(220, 50,  50),
+  green    = Color3.fromRGB(60,  210, 110),
+  text     = Color3.fromRGB(230, 235, 255),
+  dim      = Color3.fromRGB(120, 130, 170),
+  white    = Color3.fromRGB(255, 255, 255),
 }
 
-def _rand_name(length=None):
-    if length is None:
-        length = _RNG.randint(8, 16)
-    chars = string.ascii_letters + string.digits
-    return random.choice(string.ascii_letters) + "".join(_RNG.choice(chars) for _ in range(length - 1))
+if _G.__asta_pro_kill then pcall(_G.__asta_pro_kill); task.wait(0.7) end
 
-def _rand_names(n):
-    seen = set()
-    out = []
-    while len(out) < n:
-        name = _rand_name()
-        if name not in seen and name not in _RESERVED_LUA:
-            seen.add(name)
-            out.append(name)
+-- ══ أدوات مساعدة ══
+local function randomName()
+  local t = ""
+  for _ = 1, math.random(10,16) do t = t .. string.char(math.random(97,122)) end
+  return t
+end
+
+-- ══ device spoof (نفس منطق v14 بدون تغيير) ══
+local function setTargetDevice(device)
+  if device == "Pc" or device == "pc" then device = "PC" end
+  if writefile then
+    pcall(writefile,"sys_cfg_v5_cache.bin",device)
+    pcall(writefile,"asta_device.txt",device)
+  end
+  _G.TargetDevice = device
+end
+local function getTargetDevice()
+  local d = _G.TargetDevice
+  if d == "Pc" or d == "pc" then d = "PC" end
+  if (d == nil or d == "") and type(isfile)=="function" and type(readfile)=="function" then
+    for _, fname in ipairs({"asta_device.txt","sys_cfg_v5_cache.bin"}) do
+      local ok,v = pcall(function()
+        if isfile(fname) then return readfile(fname) end
+      end)
+      if ok and type(v)=="string" then
+        v = v:gsub("%s+","")
+        if v=="Pc" or v=="pc" then v="PC" end
+        if v=="Console" or v=="Mobile" or v=="PC" then d=v; _G.TargetDevice=v; break end
+      end
+    end
+  end
+  return d
+end
+local lockSeen = setmetatable({},{__mode="k"})
+local lockOn,cursorRef = false,nil
+local function applyCursor() if cursorRef then cursorRef.Visible = lockOn end end
+local function forceAncestors(inst)
+  local p = inst.Parent
+  while p and p ~= game do
+    if p:IsA("ScreenGui") then
+      if not p.Enabled then p.Enabled=true end
+      if not lockSeen[p] then lockSeen[p]=true
+        p:GetPropertyChangedSignal("Enabled"):Connect(function()
+          if not p.Enabled and not _G.__dm_killed then p.Enabled=true end
+        end)
+      end
+      break
+    elseif p:IsA("GuiObject") then
+      if not p.Visible then p.Visible=true end
+      if not lockSeen[p] then lockSeen[p]=true
+        p:GetPropertyChangedSignal("Visible"):Connect(function()
+          if not p.Visible and not _G.__dm_killed then p.Visible=true end
+        end)
+      end
+    end
+    p = p.Parent
+  end
+end
+local function lockFix(inst)
+  if lockSeen[inst] then return end
+  local n = inst.Name
+  if n~="ConsoleButton" and n~="ShiftLockArea" and n~="Toggle" and n~="MouseLockedCursor" then return end
+  if not inst:IsA("GuiObject") then return end
+  if n=="ConsoleButton" then lockSeen[inst]=true; inst.Visible=false
+  elseif n=="ShiftLockArea" then
+    lockSeen[inst]=true; inst.Visible=true
+    inst:GetPropertyChangedSignal("Visible"):Connect(function()
+      if not inst.Visible and not _G.__dm_killed then inst.Visible=true end
+    end)
+    forceAncestors(inst)
+  elseif n=="Toggle" and inst.Parent and inst.Parent.Name=="ShiftLockArea" then
+    lockSeen[inst]=true; inst.Visible=true
+    inst:GetPropertyChangedSignal("Visible"):Connect(function()
+      if not inst.Visible and not _G.__dm_killed then inst.Visible=true end
+    end)
+    forceAncestors(inst)
+    if inst:IsA("GuiButton") then
+      inst.MouseButton1Click:Connect(function() lockOn=not lockOn; applyCursor() end)
+    end
+  elseif n=="MouseLockedCursor" then
+    lockSeen[inst]=true; cursorRef=inst; inst.Visible=lockOn
+    inst:GetPropertyChangedSignal("Visible"):Connect(function()
+      if inst.Visible~=lockOn and not _G.__dm_killed then inst.Visible=lockOn end
+    end)
+  end
+end
+local function watchLock()
+  local lp = Players.LocalPlayer
+  if not lp then return end
+  task.spawn(function()
+    local pg = lp:FindFirstChild("PlayerGui") or lp:WaitForChild("PlayerGui")
+    pg.DescendantAdded:Connect(function(d) pcall(lockFix,d) end)
+    for _,d in ipairs(pg:GetDescendants()) do pcall(lockFix,d) end
+    local t0 = os.clock()
+    while os.clock()-t0<60 and not _G.__dm_killed do
+      pcall(function()
+        local area = pg:FindFirstChild("ShiftLockArea",true)
+        if area and area:IsA("GuiObject") then
+          if lockSeen[area] then
+            if not area.Visible then area.Visible=true end
+            local tg=area:FindFirstChild("Toggle")
+            if tg and tg:IsA("GuiObject") and not tg.Visible then tg.Visible=true end
+            forceAncestors(area)
+          else
+            lockFix(area)
+            local tg=area:FindFirstChild("Toggle"); if tg then lockFix(tg) end
+            local cur=pg:FindFirstChild("MouseLockedCursor",true); if cur then lockFix(cur) end
+          end
+        end
+      end)
+      task.wait(2)
+    end
+  end)
+end
+local patchedCache = setmetatable({},{__mode="k"})
+local scanning,lastFullScan = false,0
+local DEVICE_KEYS = {"Device","Platform","DeviceType","DeviceName","InputDevice","Platform_","CurrentDevice","CurrentPlatform","PlayerDevice","PlayerPlatform"}
+local function isDevValue(v) return v=="Mobile" or v=="PC" or v=="Console" end
+local function unlockTable(t)
+  if type(isreadonly)=="function" and type(setreadonly)=="function" then
+    local ok,ro=pcall(isreadonly,t); if ok and ro then pcall(setreadonly,t,false) end
+  elseif type(make_writeable)=="function" then pcall(make_writeable,t) end
+end
+local function patchTable(obj,device)
+  local patched,relevant=0,false
+  for _,keyName in ipairs(DEVICE_KEYS) do
+    local ok,cur=pcall(rawget,obj,keyName)
+    if ok and isDevValue(cur) then
+      relevant=true
+      if cur~=device then
+        unlockTable(obj)
+        if pcall(rawset,obj,keyName,device) then
+          patched=patched+1
+          if keyName=="Device" then
+            local fix=rawget(obj,"FixXCoordinateAspectRate")
+            if type(fix)=="function" then pcall(fix,obj) end
+          end
+        end
+      end
+    end
+  end
+  pcall(function()
+    local n=0
+    for k,v in next,obj do
+      n=n+1; if n>25 then break end
+      if type(k)=="string" and isDevValue(v) then
+        local lk=k:lower()
+        if lk:find("device") or lk:find("platform") or lk:find("plat") then
+          relevant=true
+          if v~=device then unlockTable(obj); rawset(obj,k,device); patched=patched+1 end
+        end
+      end
+    end
+  end)
+  local ok2,preferred=pcall(rawget,obj,"PreferredInput")
+  if ok2 and type(preferred)=="table" then
+    relevant=true
+    local wanted=device=="Console" and rawget(obj,"Gamepad") or rawget(obj,"Keyboard")
+    if type(wanted)=="table" and preferred~=wanted then
+      pcall(function() rawset(obj,"PreferredInput",wanted); patched=patched+1 end)
+    end
+  end
+  return patched,relevant
+end
+local function collectCandidates()
+  local list={}
+  if type(filtergc)=="function" then
+    local keys={"PreferredInput"}
+    for _,k in ipairs(DEVICE_KEYS) do keys[#keys+1]=k end
+    for _,key in ipairs(keys) do
+      local ok,res=pcall(filtergc,"table",{Keys={key}},false)
+      if ok and type(res)=="table" then for _,t in ipairs(res) do list[#list+1]=t end end
+    end
+    if #list>0 then return list end
+  end
+  if type(getgc)~="function" then return list end
+  local ok,objs=pcall(getgc,true)
+  if not ok or type(objs)~="table" then return list end
+  local n=0
+  for _,o in ipairs(objs) do n=n+1; if type(o)=="table" then list[#list+1]=o end; if n%40000==0 then task.wait() end end
+  return list
+end
+local function spoofDeviceInGc(device,fast)
+  if not device then return 0,0 end
+  local patched,scanned=0,0
+  for t in pairs(patchedCache) do patched=patched+(patchTable(t,device)) end
+  if fast then return patched,0 end
+  if os.clock()-(_G.__asta_t0 or 0)>30 and next(patchedCache)~=nil then return patched,0 end
+  local gap=(os.clock()-(_G.__asta_t0 or 0)<15) and 4 or 60
+  if scanning or os.clock()-lastFullScan<gap then return patched,0 end
+  if not (type(filtergc)=="function" or type(getgc)=="function") then
+    if not _G.__asta_nogc then _G.__asta_nogc=true; warn('[Asta] getgc/filtergc غير مدعوم') end
+    return patched,0
+  end
+  _G.__asta_nscans=(_G.__asta_nscans or 0)+1
+  if _G.__asta_nscans>3 and os.clock()-(_G.__asta_t0 or 0)<60 then _G.__asta_nscans=3; return patched,0 end
+  scanning=true; lastFullScan=os.clock()
+  pcall(function()
+    local list=collectCandidates()
+    for _,obj in ipairs(list) do
+      scanned=scanned+1; if scanned>120000 then break end
+      if scanned%4000==0 then task.wait() end
+      local p,rel=patchTable(obj,device); patched=patched+p
+      if rel then patchedCache[obj]=true end
+    end
+  end)
+  scanning=false
+  return patched,scanned
+end
+local function spoofDeviceExtra(device)
+  local lp=Players.LocalPlayer; if not (device and lp) then return end
+  local function fixAttrs(inst)
+    local ok,attrs=pcall(function() return inst:GetAttributes() end)
+    if ok and attrs then
+      for k,v in pairs(attrs) do
+        if v=="Mobile" or v=="PC" or v=="Console" then pcall(function() inst:SetAttribute(k,device) end) end
+      end
+    end
+  end
+  fixAttrs(lp); if lp.Character then fixAttrs(lp.Character) end
+end
+local function getGuiParent()
+  if typeof(gethui)=="function" then local ok,ui=pcall(gethui); if ok and ui then return ui end end
+  if typeof(get_hidden_gui)=="function" then local ok,ui=pcall(get_hidden_gui); if ok and ui then return ui end end
+  local CoreGui=game:GetService("CoreGui")
+  if syn and typeof(syn.protect_gui)=="function" then return CoreGui end
+  local lp=Players.LocalPlayer
+  return CoreGui:FindFirstChild("RobloxGui") or (lp and lp:WaitForChild("PlayerGui"))
+end
+local function asta_hideTeleportError()
+  task.spawn(function()
+    for _=1,30 do
+      pcall(function() game:GetService("GuiService"):ClearError() end)
+      pcall(function()
+        local cg=game:GetService("CoreGui")
+        local gui=cg:FindFirstChild("RobloxPromptGui")
+        local ov=gui and gui:FindFirstChild("promptOverlay")
+        if ov then for _,c in ipairs(ov:GetChildren()) do if c.Name=="ErrorPrompt" then c:Destroy() end end end
+      end)
+      task.wait(0.1)
+    end
+  end)
+end
+pcall(function()
+  if type(delfile)=="function" and type(isfile)=="function" then
+    local f="asta_norejoin_"..tostring(game.PlaceId)..".txt"
+    if isfile(f) then delfile(f) end
+  end
+end)
+_G.__asta_norejoin=nil
+local function asta_queueReload()
+  if type(queue_on_teleport)~="function" then return end
+  local dev=_G.TargetDevice or "PC"
+  local code="_G.TargetDevice='"..tostring(dev).."'; pcall(function() local f=readfile('Asta_Pro_core.lua'); loadstring(f)() end)"
+  pcall(queue_on_teleport,code)
+end
+local function asta_installHooks()
+  if _G.__asta_hooked or type(hookmetamethod)~="function" then return end
+  _G.__asta_hooked=true
+  pcall(function()
+    local UIS=game:GetService("UserInputService")
+    local GS=game:GetService("GuiService")
+    local isCaller=type(checkcaller)=="function" and checkcaller or function() return false end
+    local function gameCaller()
+      if type(getcallingscript)~="function" then return false end
+      local ok,sc=pcall(getcallingscript)
+      if not ok or typeof(sc)~="Instance" then return false end
+      local ok2,core=pcall(function()
+        return sc.Name=="PlayerModule" or sc:FindFirstAncestor("PlayerModule")~=nil
+      end)
+      return not (ok2 and core)
+    end
+    local wrap=type(newcclosure)=="function" and newcclosure or function(f) return f end
+    local oldIdx
+    oldIdx=hookmetamethod(game,"__index",wrap(function(self,key)
+      if _G.__asta_hookoff then return oldIdx(self,key) end
+      if self==UIS and type(key)=="string" then
+        local dev=_G.TargetDevice
+        if dev and (key=="TouchEnabled" or key=="KeyboardEnabled" or key=="MouseEnabled" or key=="GamepadEnabled") then
+          if not isCaller() and gameCaller() then
+            if key=="TouchEnabled" then return dev=="Mobile" end
+            if key=="GamepadEnabled" then return dev=="Console" end
+            return dev=="PC"
+          end
+        end
+      end
+      return oldIdx(self,key)
+    end))
+    local oldNc
+    oldNc=hookmetamethod(game,"__namecall",wrap(function(self,...)
+      if _G.__asta_hookoff then return oldNc(self,...) end
+      if self==GS or self==UIS then
+        local dev=_G.TargetDevice
+        if dev and not isCaller() then
+          local m=getnamecallmethod()
+          if m=="IsTenFootInterface" and self==GS and gameCaller() then return dev=="Console" end
+          if m=="GetPlatform" and self==UIS and gameCaller() then
+            return dev=="Console" and Enum.Platform.XBoxOne or dev=="PC" and Enum.Platform.Windows or Enum.Platform.IOS
+          end
+        end
+      end
+      return oldNc(self,...)
+    end))
+    task.delay(25,function()
+      _G.__asta_hookoff=true
+      pcall(hookmetamethod,game,"__index",oldIdx)
+      pcall(hookmetamethod,game,"__namecall",oldNc)
+    end)
+  end)
+end
+local function asta_notify(text)
+  pcall(function() warn("[Asta] "..text) end)
+  pcall(function()
+    local g=Instance.new("ScreenGui")
+    g.Name=randomName(); g.ResetOnSpawn=false; g.IgnoreGuiInset=true
+    g.DisplayOrder=999; g.Parent=getGuiParent()
+    local l=Instance.new("TextLabel")
+    l.Size=UDim2.fromOffset(360,52); l.Position=UDim2.new(0.5,-180,0,10)
+    l.BackgroundColor3=Color3.fromRGB(8,10,18); l.TextColor3=Color3.fromRGB(80,160,255)
+    l.TextWrapped=true; l.TextSize=13; l.Font=Enum.Font.GothamMedium; l.Text=text; l.Parent=g
+    Instance.new("UICorner",l).CornerRadius=UDim.new(0,10)
+    local st=Instance.new("UIStroke",l); st.Color=Color3.fromRGB(55,65,110); st.Thickness=1.4
+    task.delay(10,function() g:Destroy() end)
+  end)
+end
+
+_G.__dm_killed=false
+local lp=Players.LocalPlayer
+do
+  local dev=getTargetDevice()
+  if dev then
+    _G.TargetDevice=dev; asta_installHooks()
+    if not _G.__asta_lockwatch then _G.__asta_lockwatch=true; pcall(watchLock) end
+    pcall(asta_queueReload)
+    if not _G.__asta_early then
+      _G.__asta_early=true
+      task.spawn(function()
+        local t0=os.clock(); _G.__asta_t0=t0
+        while not _G.__dm_killed and os.clock()-t0<15 do
+          local d=_G.TargetDevice or dev
+          pcall(spoofDeviceInGc,d); pcall(spoofDeviceExtra,d)
+          task.wait(1)
+        end
+      end)
+    end
+  end
+end
+if not game:IsLoaded() then game.Loaded:Wait() end
+if not ALLOWED_PLACES[game.PlaceId] then
+  asta_notify("PlaceId = "..tostring(game.PlaceId).." (مو في القائمة، بس السكربت يكمل)")
+  if setclipboard then pcall(setclipboard,tostring(game.PlaceId)) end
+end
+asta_installHooks()
+if getTargetDevice() and not _G.__asta_lockwatch then _G.__asta_lockwatch=true; watchLock() end
+
+local function reapplyDevice()
+  if _G.__dm_killed then return end
+  local device=getTargetDevice()
+  if device then pcall(spoofDeviceInGc,device); pcall(spoofDeviceExtra,device) end
+end
+task.spawn(function()
+  local t0=os.clock()
+  while not _G.__dm_killed do
+    local dt=os.clock()-t0; reapplyDevice()
+    if dt<30 then task.wait(3) elseif dt<90 then task.wait(10) else break end
+  end
+end)
+task.spawn(function()
+  local pg=lp:FindFirstChild("PlayerGui") or lp:WaitForChild("PlayerGui",30)
+  if not pg then return end
+  local pending=false
+  pg.DescendantAdded:Connect(function()
+    if pending or _G.__dm_killed then return end
+    pending=true
+    task.delay(1.5,function()
+      pending=false
+      local d=getTargetDevice(); if d then pcall(spoofDeviceInGc,d,true) end
+    end)
+  end)
+  pg.ChildAdded:Connect(function()
+    if _G.__dm_killed then return end
+    task.delay(0.3,reapplyDevice)
+  end)
+end)
+lp.CharacterAdded:Connect(function() task.wait(1); if not _G.__dm_killed then reapplyDevice() end end)
+
+-- ══════════════════════════════════
+--  حالة الميزات
+-- ══════════════════════════════════
+local players,localPlayer,runService,uis,guiService,tweenService =
+  Players,lp,RunService,UIS,GuiService,TweenService
+local playerGui=lp:WaitForChild("PlayerGui")
+
+local ST = {
+  assist   = true,
+  grab     = true,
+  radar    = false,
+  track    = false,
+  esp      = false,   -- ★ جديد: هايلايت الأعداء
+  speed    = false,   -- ★ جديد: بوست السرعة
+  autojump = false,   -- ★ جديد: أوتو جمب عند الجدران
+  locked   = {},
+}
+local CFG = {
+  MAX_RANGE          = 60,
+  STOP_DIST          = 2.4,
+  RESUME_GAP         = 0.7,
+  START_DELAY        = 0.0,
+  GRAB_RANGE         = 14,
+  LEAD_MAX           = 0.55,
+  SMOOTH             = 6,
+  MAX_LOCKED         = 4,
+  RELEASE_DELAY      = 0,
+  GRAB_FALLBACK_NEAREST = false,
+  TRACK_DIST         = 2.3,
+  MATCH_RANGE        = 40,
+  FAST_TURN          = 5,
+  FAST_GRAB_CD       = 0.03,
+  DOUBLE_TAP         = 0.45,
+  ASSIST_POWER       = 48,
+  ASSIST_RANGE       = 10,
+  SPEED_BONUS        = 20,   -- ★ جديد: زيادة WalkSpeed
+  JUMP_CHECK_DIST    = 4,    -- ★ جديد: مسافة كشف الجدار أمامك
+}
+local GRAB_COOLDOWN = 0.1
+local DISPLAY = {Console="Console",Mobile="Mobile",PC="PC"}
+local GEAR_FALLBACK = {x0=0.50,y0=0.00,x1=0.70,y1=0.20}
+
+local conns,guis={},{}
+local function keep(c) conns[#conns+1]=c; return c end
+local function alive() return not _G.__dm_killed end
+_G.__asta_pro_kill = function()
+  _G.__dm_killed=true
+  for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+  pcall(function() RunService:UnbindFromRenderStep("AstaProDrive") end)
+  for _,g in ipairs(guis) do pcall(function() g:Destroy() end) end
+  -- نظّف ESP
+  pcall(function()
+    for _,p in ipairs(Players:GetPlayers()) do
+      local ch=p.Character; if ch then
+        local h=ch:FindFirstChild("__AstaESP")
+        if h then h:Destroy() end
+      end
+    end
+  end)
+  -- إرجاع السرعة الأصلية
+  pcall(function()
+    local ch=lp.Character; local hum=ch and ch:FindFirstChildOfClass("Humanoid")
+    if hum and _G.__asta_base_speed then hum.WalkSpeed=_G.__asta_base_speed end
+  end)
+end
+
+-- ══ كشف الجويستيك ══
+local manualTouches={}
+local MOVE_KEYS={Enum.KeyCode.W,Enum.KeyCode.A,Enum.KeyCode.S,Enum.KeyCode.D,
+  Enum.KeyCode.Up,Enum.KeyCode.Down,Enum.KeyCode.Left,Enum.KeyCode.Right}
+local uiBlock=function(pos) return false end
+
+keep(UIS.InputBegan:Connect(function(input)
+  if input.UserInputType~=Enum.UserInputType.Touch then return end
+  local cam=workspace.CurrentCamera; if not cam then return end
+  local pos=Vector2.new(input.Position.X,input.Position.Y)
+  if uiBlock(pos) then return end
+  if pos.X<cam.ViewportSize.X*0.45 and pos.Y>cam.ViewportSize.Y*0.45 then manualTouches[input]=true end
+end))
+keep(UIS.InputEnded:Connect(function(input) manualTouches[input]=nil end))
+local function touchHeld()
+  for input in pairs(manualTouches) do
+    local st=input.UserInputState
+    if st==Enum.UserInputState.End or st==Enum.UserInputState.Cancel then manualTouches[input]=nil end
+  end
+  return next(manualTouches)~=nil
+end
+local function keyHeld()
+  if not UIS:GetFocusedTextBox() then
+    for _,k in ipairs(MOVE_KEYS) do if UIS:IsKeyDown(k) then return true end end
+  end
+  local ok,res=pcall(function()
+    for _,io in ipairs(UIS:GetGamepadState(Enum.UserInputType.Gamepad1)) do
+      if io.KeyCode==Enum.KeyCode.Thumbstick1 and io.Position.Magnitude>0.25 then return true end
+    end
+    return false
+  end)
+  return ok and res==true
+end
+local function anyHeld() return touchHeld() or keyHeld() end
+
+-- ══ أدوات مشتركة ══
+local function isTeammate(p)
+  local myTeam=localPlayer.Team
+  if myTeam and p.Team==myTeam then return true end
+  if localPlayer.Neutral==false and p.Neutral==false and p.TeamColor==localPlayer.TeamColor then return true end
+  return false
+end
+local lastGrab=0
+local function findBomb(char)
+  local fallback
+  for _,it in ipairs(char:GetChildren()) do
+    if it:IsA("Tool") then
+      local n=it.Name:lower()
+      if n:find("bomb") or it.Name:find("قنبل") then return it end
+      fallback=fallback or it
+    end
+  end
+  return fallback
+end
+local function tryGrab(targetChar,targetRoot,myChar,myRoot,cd,all)
+  local now=os.clock()
+  if now-lastGrab<(cd or GRAB_COOLDOWN) then return end
+  lastGrab=now
+  for _,item in ipairs(myChar:GetChildren()) do
+    if item:IsA("Tool") then pcall(function() item:Activate() end) end
+  end
+  if fireproximityprompt then
+    for _,d in ipairs(targetChar:GetDescendants()) do
+      if d:IsA("ProximityPrompt") and d.Enabled then pcall(fireproximityprompt,d) end
+    end
+  end
+  if not firetouchinterest then
+    local flat=Vector3.new(targetRoot.Position.X-myRoot.Position.X,0,targetRoot.Position.Z-myRoot.Position.Z)
+    if flat.Magnitude>1.6 then
+      local step=math.min(flat.Magnitude-1.4,all and 9 or 5)
+      local dest=myRoot.Position+flat.Unit*step
+      myRoot.CFrame=CFrame.new(dest)*(myRoot.CFrame-myRoot.CFrame.Position)
+    end
+  else
+    local bomb=findBomb(targetChar)
+    local parts={targetRoot}
+    local handle=bomb and bomb:FindFirstChild("Handle")
+    if handle then table.insert(parts,handle) end
+    for _,n in ipairs({"Torso","UpperTorso","Head","Right Arm","RightHand"}) do
+      local pt=targetChar:FindFirstChild(n); if pt then table.insert(parts,pt) end
+    end
+    if all then
+      local function addAll(root0)
+        for _,d in ipairs(root0:GetDescendants()) do
+          if #parts>=24 then return end
+          if d:IsA("BasePart") then table.insert(parts,d) end
+        end
+      end
+      addAll(targetChar); if bomb then addAll(bomb) end
+    end
+    pcall(function()
+      for _,pt in ipairs(parts) do firetouchinterest(myRoot,pt,0); firetouchinterest(myRoot,pt,1) end
+    end)
+  end
+end
+
+-- ══ كشف اللاعبين الخضر ══
+local isGreenTeammate
+do
+  local function isGreenColor(c) return c and c.G>0.45 and c.G>c.R*1.35 and c.G>c.B*1.35 end
+  local function colorsOf(inst)
+    local out={}
+    if inst:IsA("Highlight") then table.insert(out,inst.FillColor); table.insert(out,inst.OutlineColor)
+    elseif inst:IsA("SelectionBox") or inst:IsA("SelectionSphere") then table.insert(out,inst.Color3)
+    elseif inst:IsA("TextLabel") or inst:IsA("TextButton") then
+      table.insert(out,inst.TextColor3)
+      if inst.BackgroundTransparency<0.9 then table.insert(out,inst.BackgroundColor3) end
+    elseif inst:IsA("ImageLabel") then table.insert(out,inst.ImageColor3)
+    elseif inst:IsA("Frame") and inst.BackgroundTransparency<0.9 then table.insert(out,inst.BackgroundColor3)
+    elseif inst:IsA("UIStroke") then table.insert(out,inst.Color)
+    end
     return out
-
-def _strip_comments(src: str) -> str:
-    src = re.sub(r'--\[(=*)\[.*?\]\1\]', '', src, flags=re.DOTALL)
-    lines = []
-    for line in src.split('\n'):
-        in_str = False
-        result = []
-        i = 0
-        while i < len(line):
-            c = line[i]
-            if c in ('"', "'") and not in_str:
-                in_str = c
-                result.append(c)
-            elif in_str and c == in_str and (i == 0 or line[i-1] != '\\'):
-                in_str = False
-                result.append(c)
-            elif not in_str and c == '-' and i+1 < len(line) and line[i+1] == '-':
-                break
-            else:
-                result.append(c)
-            i += 1
-        lines.append(''.join(result))
-    return '\n'.join(lines)
-
-def _xor_encrypt(data: bytes, key: bytes) -> bytes:
-    out = bytearray(len(data))
-    kl = len(key)
-    for i, b in enumerate(data):
-        out[i] = b ^ key[i % kl] ^ ((i * 7 + 13) & 0xFF)
-    return bytes(out)
-
-def _build_decryptor(encrypted: bytes, key: bytes) -> str:
-    def to_lua_str(b: bytes) -> str:
-        return '"' + "".join(f"\\{byte}" for byte in b) + '"'
-
-    lua_enc = to_lua_str(encrypted)
-    lua_key = to_lua_str(key)
-    v_enc, v_key, v_out, v_i, v_kl, v_b, v_pos, v_fn, v_err = _rand_names(9)
-
-    return (
-        f"local {v_enc}={lua_enc}\n"
-        f"local {v_key}={lua_key}\n"
-        f"local {v_out}={{}}\n"
-        f"local {v_kl}=#{v_key}\n"
-        f"for {v_i}=1,#{v_enc} do\n"
-        f"  local {v_b}=string.byte({v_enc},{v_i})\n"
-        f"  local {v_pos}={v_i}-1\n"
-        f"  {v_out}[{v_i}]=string.char(({v_b})~string.byte({v_key},({v_pos}%{v_kl})+1)~(({v_pos}*7+13)%256))\n"
-        f"end\n"
-        f"local {v_fn},{v_err}=loadstring(table.concat({v_out}))\n"
-        f"if not {v_fn} then error({v_err}) end\n"
-        f"{v_fn}()\n"
-    )
-
-def _anti_tamper() -> str:
-    v1, v2, v3 = _rand_names(3)
-    seed = _RNG.randint(10000, 99999)
-    xval = _RNG.randint(1000, 9999)
-    return (
-        f"local {v1}={seed} local {v2}={xval} "
-        f"local {v3}=({v1}*{v2})%65537 "
-        f"if {v3}~={seed*xval%65537} then return end\n"
-    )
-
-def _obfuscate_numbers(src: str) -> str:
-    def replacer(m):
-        try:
-            n = int(m.group(0))
-            a = _RNG.randint(-9999, 9999)
-            b = n - a
-            return f"({a}+{b})"
-        except:
-            return m.group(0)
-    return re.sub(r'(?<!["\'\w.])\b([1-9][0-9]{2,})\b(?!["\'\w.])', replacer, src)
-
-def obfuscate_lua(src: str) -> str:
-    """
-    Double-layer XOR encryption + anti-tamper header.
-    Roblox executor compatible (Lua 5.1 / LuaJIT).
-    """
-    src = _strip_comments(src)
-    src = _obfuscate_numbers(src)
-
-    # layer 1
-    key1 = bytes(_RNG.randint(1, 255) for _ in range(_RNG.randint(16, 32)))
-    enc1 = _xor_encrypt(src.encode("utf-8"), key1)
-    layer1 = _build_decryptor(enc1, key1)
-
-    # layer 2 wraps layer 1
-    key2 = bytes(_RNG.randint(1, 255) for _ in range(_RNG.randint(16, 32)))
-    enc2 = _xor_encrypt(layer1.encode("utf-8"), key2)
-    layer2 = _build_decryptor(enc2, key2)
-
-    return _anti_tamper() + "\n" + layer2
-
-
-# cache: obfuscate once at startup, re-obfuscate every 6h (fresh keys each time)
-_obf_cache: dict = {"body": None, "ts": 0}
-_OBF_TTL = 6 * 3600  # 6 hours
-_obf_lock = Lock()
-
-def _inject_keys(raw: str) -> str:
-    """Replace KEY_LIST in the lua source with all active keys from DATA."""
-    now = time.time()
-    active_keys = []
-    for key, info in DATA["keys"].items():
-        uid = info.get("used_by")
-        if not uid:
-            continue
-        u = DATA["users"].get(str(uid))
-        if not u:
-            continue
-        if u.get("expires") and u["expires"] < now:
-            continue
-        if u.get("paused"):
-            continue
-        active_keys.append(key)
-    lua_list = ", ".join(f'"{k}"' for k in active_keys)
-    # replace the KEY_LIST table content
-    import re as _re
-    patched = _re.sub(
-        r'(local\s+KEY_LIST\s*=\s*\{)[^}]*(\})',
-        lambda m: m.group(1) + "\n    " + lua_list + "\n" + m.group(2),
-        raw,
-        count=1,
-    )
-    return patched
-
-
-def _get_obfuscated_script() -> str | None:
-    # read raw every time — keys change dynamically
-    try:
-        with open(SCRIPT_FILE, "r", encoding="utf-8") as f:
-            raw = f.read()
-    except Exception:
-        return None
-    raw = _inject_keys(raw)
-    try:
-        obf = obfuscate_lua(raw)
-        print(f"✅ Script obfuscated: {len(raw)} → {len(obf)} bytes")
-        return obf
-    except Exception as e:
-        print("Obfuscation error:", repr(e))
-        return raw
-
-
-# ============================================================
-#     التحقق من الجهاز وتسليم السكربت
-# ============================================================
-def script_body():
-    return _get_obfuscated_script()
-
-
-@_web.route("/script")
-def serve_script():
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
-    if is_rate_limited(ip):
-        return Response('warn("[license] too many requests")', 429, mimetype="text/plain")
-    key = (request.args.get("key") or "").strip().upper()
-    hwid = (request.args.get("hwid") or "").strip()
-    if len(hwid) < 8 or len(hwid) > 128 or not hwid.replace("-", "").isalnum():
-        return Response('warn("[license] invalid device id")', 400, mimetype="text/plain")
-    if hwid in _hwid_blacklist:
-        return Response('warn("[license] device banned")', 403, mimetype="text/plain")
-    if _script_locked:
-        reason = _script_lock_reason or "script temporarily unavailable"
-        return Response(f'warn("[license] {reason}")', 503, mimetype="text/plain")
-    info = DATA["keys"].get(key)
-    if not info or not info.get("used_by"):
-        auto_banned = _record_failed_attempt(hwid)
-        if auto_banned:
-            asyncio.run_coroutine_threadsafe(
-                notify_owners(
-                    "🤖 **Auto-Ban HWID (brute force)**\n"
-                    "HWID: `" + hwid + "`\n"
-                    "سبب: " + str(BRUTEFORCE_LIMIT) + " محاولات خاطئة خلال " + str(BRUTEFORCE_WINDOW // 60) + " دقيقة"
-                ),
-                bot.loop,
-            )
-            save()
-        return Response('warn("[license] invalid key")', 403, mimetype="text/plain")
-    u = DATA["users"].get(str(info["used_by"]))
-    if not u or u.get("key") != key:
-        return Response('warn("[license] invalid key")', 403, mimetype="text/plain")
-    if u["expires"] and u["expires"] < time.time():
-        return Response('warn("[license] key expired")', 403, mimetype="text/plain")
-    if u.get("paused"):
-        return Response('warn("[license] key paused by admin")', 403, mimetype="text/plain")
-    bound = u.get("hwid")
-    if not bound:
-        u["hwid"] = hwid
-        save()
-    elif bound != hwid:
-        return Response('warn("[license] this key is locked to another device")', 403, mimetype="text/plain")
-    body = script_body()
-    if body is None:
-        return Response('warn("[license] script not available yet")', 503, mimetype="text/plain")
-    # track execution count
-    u["runs"] = u.get("runs", 0) + 1
-    u["last_run"] = time.time()
-    save()
-    # notify owners async (non-blocking)
-    uid_str = str(info["used_by"])
-    runs = u["runs"]
-    asyncio.run_coroutine_threadsafe(
-        notify_owners(
-            f"▶️ **تشغيل سكربت**\n"
-            f"المشتري: <@{uid_str}>\n"
-            f"المفتاح: `{key}`\n"
-            f"HWID: `{hwid}`\n"
-            f"عدد مرات التشغيل: **{runs}**"
-        ),
-        bot.loop,
-    )
-    return Response(body, mimetype="text/plain")
-
-
-def loader_line(key):
-    return (
-        'loadstring(game:HttpGet("' + PUBLIC_URL + '/script?key=' + key
-        + '&hwid=" .. (function() local ok,r = pcall(function() return tostring(game:GetService("Players").LocalPlayer.UserId) end) if ok and r and #r > 2 then return r end return tostring(math.random(100000,999999)) end)())()'
-    )
-
-
-async def notify_owners(text):
-    for oid in OWNER_IDS:
-        try:
-            user = await bot.fetch_user(oid)
-            await user.send(text)
-        except Exception as e:
-            print("تعذر إرسال إشعار للأونر:", repr(e))
-
-
-def is_owner(user):
-    return user.id in OWNER_IDS
-
-
-def active_license(uid):
-    u = DATA["users"].get(str(uid))
-    if not u:
-        return None
-    if u["expires"] and u["expires"] < time.time():
-        return None
-    return u
-
-
-def fmt_expiry(u):
-    return "مدى الحياة ♾️" if not u["expires"] else "<t:" + str(int(u["expires"])) + ":R>"
-
-
-async def give_role(member):
-    if BUYER_ROLE_ID and isinstance(member, discord.Member):
-        role = member.guild.get_role(BUYER_ROLE_ID)
-        if role is not None:
-            try:
-                await member.add_roles(role, reason="تفعيل مفتاح")
-                return True
-            except Exception as e:
-                print("تعذر إعطاء الرتبة:", repr(e))
-    return False
-
-
-# ============================================================
-#                        الواجهة
-# ============================================================
-class RedeemModal(discord.ui.Modal, title="تفعيل المفتاح"):
-    key = discord.ui.TextInput(label="المفتاح", placeholder="XXXX-XXXX-XXXX", min_length=6, max_length=40)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        k = self.key.value.strip().upper()
-        info = DATA["keys"].get(k)
-        if info is None:
-            await interaction.response.send_message("❌ المفتاح غير صحيح.", ephemeral=True)
-            return
-        if info["used_by"]:
-            await interaction.response.send_message("❌ هذا المفتاح مستخدم من قبل.", ephemeral=True)
-            return
-        if active_license(interaction.user.id):
-            await interaction.response.send_message("⚠️ عندك ترخيص فعّال بالفعل.", ephemeral=True)
-            return
-        now = time.time()
-        info["used_by"] = interaction.user.id
-        DATA["users"][str(interaction.user.id)] = {
-            "key": k,
-            "redeemed": now,
-            "expires": (now + info["days"] * 86400) if info["days"] else 0,
-            "resets": 0,
-            "last_reset": 0,
-        }
-        save_bg()
-        got_role = await give_role(interaction.user)
-        await interaction.response.send_message(
-            "✅ تم تفعيل المفتاح! اضغط **Get Script** لاستلام المشروع."
-            + (" وتم إعطاؤك رتبة المشتري." if got_role else ""),
-            ephemeral=True,
-        )
-        exp = ("مدى الحياة ♾️" if not info["days"] else "<t:" + str(int(now + info["days"] * 86400)) + ":R>")
-        await notify_owners(
-            "🔑 **تفعيل مفتاح**\n"
-            "المشتري: " + interaction.user.mention + " (`" + str(interaction.user.id) + "`)\n"
-            "المفتاح: `" + k + "`\n"
-            "الصلاحية: " + exp
-        )
-
-
-class PanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def on_error(self, interaction, error, item):
-        import traceback
-        print("❌ خطأ في الزر", getattr(item, "custom_id", "?"))
-        traceback.print_exception(type(error), error, error.__traceback__)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send("⚠️ صار خطأ، حاول مرة ثانية.", ephemeral=True)
-            else:
-                await interaction.response.send_message("⚠️ صار خطأ، حاول مرة ثانية.", ephemeral=True)
-        except Exception:
-            pass
-
-    @discord.ui.button(label="Redeem Key", emoji="🔑", style=discord.ButtonStyle.success, custom_id="kp:redeem", row=0)
-    async def redeem(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RedeemModal())
-
-    @discord.ui.button(label="Get Script", emoji="📜", style=discord.ButtonStyle.primary, custom_id="kp:script", row=0)
-    async def get_script(self, interaction: discord.Interaction, button: discord.ui.Button):
-        u = active_license(interaction.user.id)
-        if not u:
-            await interaction.response.send_message("🔒 ما عندك ترخيص فعّال. فعّل مفتاحك أول.", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "📜 انسخ هذا السطر وشغّله. **مربوط بجهازك الأول**، وإذا أعطيته لشخص ما راح يشتغل عنده:\n```lua\n"
-            + loader_line(u["key"]) + "\n```",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Get Role", emoji="👤", style=discord.ButtonStyle.primary, custom_id="kp:role", row=1)
-    async def get_role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not active_license(interaction.user.id):
-            await interaction.response.send_message("🔒 ما عندك ترخيص فعّال.", ephemeral=True)
-            return
-        ok = await give_role(interaction.user)
-        await interaction.response.send_message(
-            "✅ تم إعطاؤك الرتبة." if ok else "⚠️ ما قدرت أعطيك الرتبة (تأكد من BUYER_ROLE_ID وصلاحيات البوت).",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Reset HWID", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="kp:reset", row=1)
-    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
-        u = active_license(interaction.user.id)
-        if not u:
-            await interaction.response.send_message("🔒 ما عندك ترخيص فعّال.", ephemeral=True)
-            return
-        left = u["last_reset"] + RESET_COOLDOWN - time.time()
-        if left > 0:
-            await interaction.response.send_message(
-                "⏳ تقدر تعمل Reset بعد **" + str(int(left // 3600) + 1) + "** ساعة.", ephemeral=True
-            )
-            return
-        u["resets"] += 1
-        u["last_reset"] = time.time()
-        u["hwid"] = None
-        save_bg()
-        await interaction.response.send_message(
-            "✅ تم تصفير ربط الجهاز. أول جهاز تشغّل عليه السكربت بعد الآن يتسجّل.", ephemeral=True
-        )
-        await notify_owners(
-            "⚙️ **Reset HWID**\nالمشتري: " + interaction.user.mention + " (`" + str(interaction.user.id) + "`)\n"
-            "عدد المرات الكلي: **" + str(u["resets"]) + "**"
-        )
-
-    @discord.ui.button(label="Get Stats", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="kp:stats", row=2)
-    async def stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        u = DATA["users"].get(str(interaction.user.id))
-        if not u:
-            await interaction.response.send_message("ما عندك ترخيص مسجّل.", ephemeral=True)
-            return
-        e = discord.Embed(title="📊 إحصائياتك", color=BLUE)
-        e.add_field(name="الحالة", value="فعّال ✅" if active_license(interaction.user.id) else "منتهي ❌", inline=True)
-        e.add_field(name="ينتهي", value=fmt_expiry(u), inline=True)
-        e.add_field(name="تاريخ التفعيل", value="<t:" + str(int(u["redeemed"])) + ":D>", inline=True)
-        e.add_field(name="عدد الـ Reset", value=str(u["resets"]), inline=True)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-# ============================================================
-#                   Owner: /reobfuscate
-# ============================================================
-# slash command to force fresh obfuscation immediately
-# useful after updating the script file
-
-
-# ============================================================
-#                        البوت
-# ============================================================
-intents = discord.Intents.default()
-
-
-class KeyBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents, status=discord.Status.invisible)
-
-    async def setup_hook(self):
-        self.add_view(PanelView())
-
-
-bot = KeyBot()
-
-_started = False
-
-
-async def sync_guild(guild):
-    try:
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-    except Exception as ex:
-        print("⚠️ sync فشل في", guild.id, repr(ex))
-
-
-@bot.event
-async def on_ready():
-    global _started
-    print("✅ شغّال كـ", bot.user)
-    if _started:
-        return
-    _started = True
-    try:
-        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
-    except Exception as ex:
-        print("⚠️ مسح global فشل", repr(ex))
-    for g in list(bot.guilds):
-        if ALLOWED_GUILDS and g.id not in ALLOWED_GUILDS:
-            await g.leave()
-            continue
-        await sync_guild(g)
-    # pre-obfuscate at startup in background
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _get_obfuscated_script)
-    await notify_owners(
-        "🟢 **البوت شغال / ريستارت**\n"
-        "الوقت: <t:" + str(int(time.time())) + ":F>\n"
-        "السيرفرات: **" + str(len(bot.guilds)) + "**\n"
-        "🔒 التشفير: مفعّل (يتجدد كل 6 ساعات)"
-    )
-    bot.loop.create_task(daily_report())
-    bot.loop.create_task(expiry_notifier())
-
-
-@bot.event
-async def on_guild_join(guild):
-    if ALLOWED_GUILDS and guild.id not in ALLOWED_GUILDS:
-        await guild.leave()
-        return
-    await sync_guild(guild)
-
-
-# ============================================================
-#                   Daily Report
-# ============================================================
-async def daily_report():
-    await bot.wait_until_ready()
-    while True:
-        await asyncio.sleep(86400)
-        now = time.time()
-        total = len(DATA["users"])
-        active = sum(1 for u in DATA["users"].values() if not u["expires"] or u["expires"] > now)
-        expired = total - active
-        total_resets = sum(u.get("resets", 0) for u in DATA["users"].values())
-        await notify_owners(
-            "📋 **تقرير يومي — " + PROJECT_NAME + "**\n"
-            "المشترين الكلي: **" + str(total) + "**\n"
-            "فعّالين: **" + str(active) + "**\n"
-            "منتهين: **" + str(expired) + "**\n"
-            "Resets الكلي: **" + str(total_resets) + "**"
-        )
-
-
-# ============================================================
-#                   Expiry Notifier (3 days)
-# ============================================================
-async def expiry_notifier():
-    await bot.wait_until_ready()
-    notified = set()
-    while True:
-        await asyncio.sleep(3600)
-        now = time.time()
-        for uid, u in DATA["users"].items():
-            if not u["expires"]:
-                continue
-            left = u["expires"] - now
-            if 0 < left < 3 * 86400 and uid not in notified:
-                try:
-                    user = await bot.fetch_user(int(uid))
-                    await user.send(
-                        "⚠️ **تنبيه انتهاء الترخيص**\n"
-                        "ترخيصك في **" + PROJECT_NAME + "** ينتهي " + fmt_expiry(u) + ".\n"
-                        "تواصل مع الأونر للتجديد."
-                    )
-                    notified.add(uid)
-                except Exception:
-                    pass
-
-
-# ============================================================
-#                        الأوامر
-# ============================================================
-@bot.tree.command(name="panel", description="انشر لوحة التحكم (للأونر)")
-async def panel(interaction: discord.Interaction):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    e = discord.Embed(
-        title=PROJECT_NAME + " Control Panel",
-        description="لوحة التحكم الخاصة بمشروع **" + PROJECT_NAME + "**.\n"
-        "إذا كنت مشتري، اضغط الأزرار بالأسفل لتفعيل مفتاحك أو استلام المشروع أو الرتبة.",
-        color=BLUE,
-    )
-    await interaction.response.send_message(embed=e, view=PanelView())
-
-
-@bot.tree.command(name="genkey", description="توليد مفاتيح جديدة (للأونر)")
-@app_commands.describe(count="عدد المفاتيح (1-100)", days="مدة الصلاحية بالأيام (0 = مدى الحياة)")
-async def genkey(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100] = 1,
-                 days: app_commands.Range[int, 0, 3650] = 30):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    keys = []
-    for _ in range(count):
-        k = "-".join(secrets.token_hex(2).upper() for _ in range(3))
-        DATA["keys"][k] = {"days": days, "used_by": None}
-        keys.append(k)
-    await asyncio.to_thread(save)
-    await interaction.followup.send(
-        "🔑 المفاتيح (" + ("مدى الحياة" if not days else str(days) + " يوم") + "):\n```\n" + "\n".join(keys) + "\n```",
-        ephemeral=True,
-    )
-    await notify_owners(
-        "🗝️ **توليد مفاتيح**\n"
-        "بواسطة: " + interaction.user.mention + "\n"
-        "العدد: **" + str(count) + "** | المدة: " + ("مدى الحياة" if not days else str(days) + " يوم") + "\n"
-        "المفاتيح:\n```\n" + "\n".join(keys) + "\n```"
-    )
-
-
-@bot.tree.command(name="revoke", description="سحب ترخيص مشتري (للأونر)")
-async def revoke(interaction: discord.Interaction, member: discord.Member):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].pop(str(member.id), None)
-    if not u:
-        await interaction.response.send_message("هذا العضو ما عنده ترخيص.", ephemeral=True)
-        return
-    save_bg()
-    if BUYER_ROLE_ID:
-        role = interaction.guild.get_role(BUYER_ROLE_ID)
-        if role is not None:
-            try:
-                await member.remove_roles(role, reason="سحب ترخيص")
-            except Exception as e:
-                print("تعذر سحب الرتبة:", repr(e))
-    await interaction.response.send_message("✅ تم سحب الترخيص من " + member.mention, ephemeral=True)
-
-
-@bot.tree.command(name="resetuser", description="تصفير HWID لمشتري بدون cooldown (للأونر)")
-@app_commands.describe(member="المشتري")
-async def resetuser(interaction: discord.Interaction, member: discord.Member):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].get(str(member.id))
-    if not u:
-        await interaction.response.send_message("هذا العضو ما عنده ترخيص.", ephemeral=True)
-        return
-    u["hwid"] = None
-    u["last_reset"] = 0
-    save_bg()
-    await interaction.response.send_message(
-        "✅ تم تصفير HWID لـ " + member.mention + ". يقدر يستخدم Reset الحين.", ephemeral=True
-    )
-    await notify_owners(
-        "🔧 **Owner Reset HWID**\nبواسطة: " + interaction.user.mention +
-        "\nللمشتري: " + member.mention + " (`" + str(member.id) + "`)"
-    )
-
-
-@bot.tree.command(name="addtime", description="تمديد ترخيص مشتري (للأونر)")
-@app_commands.describe(member="المشتري", days="عدد الأيام للإضافة")
-async def addtime(interaction: discord.Interaction, member: discord.Member, days: app_commands.Range[int, 1, 3650]):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].get(str(member.id))
-    if not u:
-        await interaction.response.send_message("هذا العضو ما عنده ترخيص.", ephemeral=True)
-        return
-    if not u["expires"]:
-        await interaction.response.send_message("ترخيصه مدى الحياة، ما يحتاج تمديد.", ephemeral=True)
-        return
-    u["expires"] += days * 86400
-    save_bg()
-    await interaction.response.send_message(
-        "✅ تم إضافة **" + str(days) + "** يوم لـ " + member.mention + ". ينتهي " + fmt_expiry(u),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="listusers", description="قائمة المشترين (للأونر)")
-async def listusers(interaction: discord.Interaction):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    now = time.time()
-    if not DATA["users"]:
-        await interaction.followup.send("ما في مشترين.", ephemeral=True)
-        return
-    lines = []
-    for uid, u in DATA["users"].items():
-        status = "✅" if (not u["expires"] or u["expires"] > now) else "❌"
-        exp = "♾️" if not u["expires"] else "<t:" + str(int(u["expires"])) + ":d>"
-        lines.append(status + " <@" + uid + "> | ينتهي: " + exp + " | Reset: " + str(u.get("resets", 0)) + " | تشغيل: " + str(u.get("runs", 0)))
-    e = discord.Embed(title="👥 المشترين — " + PROJECT_NAME, color=BLUE,
-                      description="\n".join(lines[:25]))
-    e.set_footer(text="الكلي: " + str(len(DATA["users"])))
-    await interaction.followup.send(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="ownerstats", description="إحصائيات المشروع (للأونر)")
-async def ownerstats(interaction: discord.Interaction):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    now = time.time()
-    total = len(DATA["users"])
-    active = sum(1 for u in DATA["users"].values() if not u["expires"] or u["expires"] > now)
-    expired = total - active
-    unused_keys = sum(1 for k in DATA["keys"].values() if not k["used_by"])
-    total_resets = sum(u.get("resets", 0) for u in DATA["users"].values())
-    blacklisted = len(_hwid_blacklist)
-    obf_age = int((time.time() - _obf_cache["ts"]) / 60) if _obf_cache["ts"] else -1
-    e = discord.Embed(title="📊 إحصائيات " + PROJECT_NAME, color=BLUE)
-    e.add_field(name="المشترين الكلي", value=str(total), inline=True)
-    e.add_field(name="فعّالين", value=str(active), inline=True)
-    e.add_field(name="منتهين", value=str(expired), inline=True)
-    e.add_field(name="مفاتيح غير مستخدمة", value=str(unused_keys), inline=True)
-    e.add_field(name="Resets الكلي", value=str(total_resets), inline=True)
-    total_runs = sum(u.get("runs", 0) for u in DATA["users"].values())
-    e.add_field(name="HWIDs محجوبة", value=str(blacklisted), inline=True)
-    e.add_field(name="▶️ تشغيل الكلي", value=str(total_runs), inline=True)
-    e.add_field(name="🔒 آخر تشفير", value=f"منذ {obf_age} دقيقة" if obf_age >= 0 else "لم يتم بعد", inline=True)
-    lockdown_val = f"🔴 موقوف\n`{_script_lock_reason}`" if _script_locked else "🟢 يعمل"
-    e.add_field(name="حالة السكربت", value=lockdown_val, inline=True)
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="reobfuscate", description="إعادة تشفير السكربت فوراً (للأونر)")
-async def reobfuscate(interaction: discord.Interaction):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    # force cache expiry
-    with _obf_lock:
-        _obf_cache["ts"] = 0
-    result = await asyncio.to_thread(_get_obfuscated_script)
-    if result:
-        size_kb = len(result) // 1024
-        await interaction.followup.send(
-            f"✅ تم إعادة التشفير.\nالحجم الجديد: **{size_kb} KB**", ephemeral=True
-        )
-    else:
-        await interaction.followup.send("❌ فشل التشفير — تأكد من وجود الملف.", ephemeral=True)
-
-
-# ============================================================
-#              lockdown / unlock — سحب السكربت من الكل
-# ============================================================
-@bot.tree.command(name="lockdown", description="إيقاف تسليم السكربت لجميع المشترين فوراً (للأونر)")
-@app_commands.describe(reason="سبب الإيقاف (يظهر في الـ executor للمشتري)")
-async def lockdown(interaction: discord.Interaction, reason: str = "under maintenance"):
-    global _script_locked, _script_lock_reason
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    if _script_locked:
-        await interaction.response.send_message("⚠️ السكربت موقوف بالفعل.", ephemeral=True)
-        return
-    _script_locked = True
-    _script_lock_reason = reason
-    active_count = sum(
-        1 for u in DATA["users"].values()
-        if not u.get("expires") or u["expires"] > time.time()
-    )
-    await interaction.response.send_message(
-        f"🔴 **Lockdown مفعّل**\n"
-        f"السكربت الحين محجوب عن **{active_count}** مشتري فعّال.\n"
-        f"السبب: `{reason}`\n"
-        f"استخدم `/unlock` لإعادة التفعيل.",
-        ephemeral=True,
-    )
-    await notify_owners(
-        f"🔴 **LOCKDOWN**\nبواسطة: {interaction.user.mention}\n"
-        f"المشترين المتأثرين: **{active_count}**\n"
-        f"السبب: `{reason}`"
-    )
-
-
-@bot.tree.command(name="unlock", description="إعادة تفعيل تسليم السكربت لجميع المشترين (للأونر)")
-async def unlock(interaction: discord.Interaction):
-    global _script_locked, _script_lock_reason
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    if not _script_locked:
-        await interaction.response.send_message("⚠️ السكربت مش موقوف أصلاً.", ephemeral=True)
-        return
-    _script_locked = False
-    _script_lock_reason = ""
-    await interaction.response.send_message(
-        "🟢 **Lockdown رُفع** — السكربت يُسلَّم الحين لجميع المشترين الفعّالين.",
-        ephemeral=True,
-    )
-    await notify_owners(
-        f"🟢 **UNLOCK**\nبواسطة: {interaction.user.mention}\n"
-        f"السكربت متاح مجدداً لجميع المشترين."
-    )
-
-
-@bot.tree.command(name="banhwid", description="حجب HWID (للأونر)")
-@app_commands.describe(hwid="الـ HWID المراد حجبه")
-async def banhwid(interaction: discord.Interaction, hwid: str):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    _hwid_blacklist.add(hwid)
-    DATA["blacklist"] = list(_hwid_blacklist)
-    save_bg()
-    await interaction.response.send_message("🚫 تم حجب HWID: `" + hwid + "`", ephemeral=True)
-
-
-@bot.tree.command(name="unbanhwid", description="رفع حجب HWID (للأونر)")
-@app_commands.describe(hwid="الـ HWID المراد رفع حجبه")
-async def unbanhwid(interaction: discord.Interaction, hwid: str):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    _hwid_blacklist.discard(hwid)
-    DATA["blacklist"] = list(_hwid_blacklist)
-    save_bg()
-    await interaction.response.send_message("✅ تم رفع حجب HWID: `" + hwid + "`", ephemeral=True)
-
-
-@bot.tree.command(name="banhwiduser", description="حجب HWID مشتري مباشرة بالمنشن (للأونر)")
-@app_commands.describe(member="المشتري")
-async def banhwiduser(interaction: discord.Interaction, member: discord.Member):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].get(str(member.id))
-    if not u or not u.get("hwid"):
-        await interaction.response.send_message("هذا العضو ما عنده HWID مسجّل.", ephemeral=True)
-        return
-    hwid = u["hwid"]
-    _hwid_blacklist.add(hwid)
-    DATA["blacklist"] = list(_hwid_blacklist)
-    save_bg()
-    await interaction.response.send_message(
-        "🚫 تم حجب HWID لـ " + member.mention + "\nHWID: `" + hwid + "`", ephemeral=True
-    )
-    await notify_owners(
-        "🚫 **banhwid by member**\nبواسطة: " + interaction.user.mention +
-        "\nالعضو: " + member.mention + " (`" + str(member.id) + "`)\nHWID: `" + hwid + "`"
-    )
-
-
-@bot.tree.command(name="transfer", description="نقل ترخيص من مشتري لآخر (للأونر)")
-@app_commands.describe(from_member="المشتري الأصلي", to_member="المشتري الجديد",
-                       keep_hwid="ابقِ HWID المرتبط؟ (افتراضي: لا)")
-async def transfer(interaction: discord.Interaction, from_member: discord.Member,
-                   to_member: discord.Member, keep_hwid: bool = False):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    src = DATA["users"].pop(str(from_member.id), None)
-    if not src:
-        await interaction.response.send_message("المشتري الأصلي ما عنده ترخيص.", ephemeral=True)
-        return
-    if DATA["users"].get(str(to_member.id)):
-        await interaction.response.send_message(
-            "⚠️ " + to_member.mention + " عنده ترخيص بالفعل. revoke أول.", ephemeral=True
-        )
-        DATA["users"][str(from_member.id)] = src
-        return
-    if not keep_hwid:
-        src["hwid"] = None
-        src["last_reset"] = 0
-    DATA["users"][str(to_member.id)] = src
-    key_info = DATA["keys"].get(src["key"])
-    if key_info:
-        key_info["used_by"] = to_member.id
-    save_bg()
-    if BUYER_ROLE_ID:
-        role = interaction.guild.get_role(BUYER_ROLE_ID)
-        if role:
-            try:
-                await from_member.remove_roles(role, reason="نقل ترخيص")
-            except Exception:
-                pass
-            try:
-                await to_member.add_roles(role, reason="نقل ترخيص")
-            except Exception:
-                pass
-    await interaction.response.send_message(
-        "✅ تم نقل الترخيص من " + from_member.mention + " إلى " + to_member.mention +
-        ("\n🔗 HWID محتفظ به." if keep_hwid else "\n🔄 HWID تم تصفيره للعضو الجديد."),
-        ephemeral=True,
-    )
-    await notify_owners(
-        "🔀 **Transfer License**\nبواسطة: " + interaction.user.mention +
-        "\nمن: " + from_member.mention + " → إلى: " + to_member.mention +
-        "\nHWID: " + ("محتفظ" if keep_hwid else "صُفِّر")
-    )
-
-
-@bot.tree.command(name="pause", description="تجميد ترخيص (يوقف عداد الوقت) (للأونر)")
-@app_commands.describe(member="المشتري")
-async def pause_license(interaction: discord.Interaction, member: discord.Member):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].get(str(member.id))
-    if not u:
-        await interaction.response.send_message("هذا العضو ما عنده ترخيص.", ephemeral=True)
-        return
-    if u.get("paused"):
-        await interaction.response.send_message("⚠️ الترخيص مجمّد بالفعل.", ephemeral=True)
-        return
-    if not u["expires"]:
-        await interaction.response.send_message("ترخيصه مدى الحياة، التجميد ما يؤثر عليه.", ephemeral=True)
-        return
-    u["paused"] = True
-    u["paused_at"] = time.time()
-    save_bg()
-    await interaction.response.send_message("⏸️ تم تجميد ترخيص " + member.mention, ephemeral=True)
-    await notify_owners(
-        "⏸️ **Pause License**\nبواسطة: " + interaction.user.mention +
-        "\nالعضو: " + member.mention
-    )
-
-
-@bot.tree.command(name="resume", description="استئناف ترخيص مجمّد (للأونر)")
-@app_commands.describe(member="المشتري")
-async def resume_license(interaction: discord.Interaction, member: discord.Member):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    u = DATA["users"].get(str(member.id))
-    if not u:
-        await interaction.response.send_message("هذا العضو ما عنده ترخيص.", ephemeral=True)
-        return
-    if not u.get("paused"):
-        await interaction.response.send_message("⚠️ الترخيص مش مجمّد.", ephemeral=True)
-        return
-    frozen_duration = time.time() - u.get("paused_at", time.time())
-    if u["expires"]:
-        u["expires"] += frozen_duration
-    u.pop("paused", None)
-    u.pop("paused_at", None)
-    save_bg()
-    await interaction.response.send_message(
-        "▶️ تم استئناف ترخيص " + member.mention +
-        "\n+**" + str(int(frozen_duration // 3600)) + "** ساعة أُضيفت للصلاحية.",
-        ephemeral=True,
-    )
-    await notify_owners(
-        "▶️ **Resume License**\nبواسطة: " + interaction.user.mention +
-        "\nالعضو: " + member.mention +
-        "\nمدة التجميد: " + str(int(frozen_duration // 3600)) + " ساعة أُعيدت"
-    )
-
-
-@bot.tree.command(name="whoishwid", description="اعرف مين يملك HWID معيّن (للأونر)")
-@app_commands.describe(hwid="الـ HWID")
-async def whoishwid(interaction: discord.Interaction, hwid: str):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    hwid = hwid.strip()
-    matches = [(uid, u) for uid, u in DATA["users"].items() if u.get("hwid") == hwid]
-    if not matches:
-        banned_note = " *(محجوب)*" if hwid in _hwid_blacklist else ""
-        await interaction.response.send_message(
-            "❌ ما في مشتري مرتبط بهذا الـ HWID." + banned_note, ephemeral=True
-        )
-        return
-    uid, u = matches[0]
-    e = discord.Embed(title="🔍 whois HWID", color=BLUE)
-    e.add_field(name="HWID", value="`" + hwid + "`", inline=False)
-    e.add_field(name="المشتري", value="<@" + uid + ">", inline=True)
-    e.add_field(name="المفتاح", value="`" + u.get("key", "?") + "`", inline=True)
-    e.add_field(name="الحالة",
-                value="فعّال ✅" if (not u["expires"] or u["expires"] > time.time()) else "منتهي ❌",
-                inline=True)
-    e.add_field(name="ينتهي", value=fmt_expiry(u), inline=True)
-    e.add_field(name="محجوب؟", value="نعم 🚫" if hwid in _hwid_blacklist else "لا ✅", inline=True)
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="executions", description="قائمة المشترين وعدد مرات تشغيل السكربت (للأونر)")
-@app_commands.describe(sort="رتّب حسب: runs (الأكثر تشغيلاً) أو recent (الأحدث)")
-@app_commands.choices(sort=[
-    app_commands.Choice(name="الأكثر تشغيلاً", value="runs"),
-    app_commands.Choice(name="الأحدث تشغيلاً", value="recent"),
-])
-async def executions(interaction: discord.Interaction, sort: str = "runs"):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    now = time.time()
-    users = [
-        (uid, u) for uid, u in DATA["users"].items()
-    ]
-    if sort == "recent":
-        users.sort(key=lambda x: x[1].get("last_run", 0), reverse=True)
-    else:
-        users.sort(key=lambda x: x[1].get("runs", 0), reverse=True)
-    if not users:
-        await interaction.followup.send("ما في مشترين.", ephemeral=True)
-        return
-    total_runs = sum(u.get("runs", 0) for _, u in users)
-    lines = []
-    for uid, u in users[:25]:
-        runs = u.get("runs", 0)
-        last = u.get("last_run")
-        last_str = f"<t:{int(last)}:R>" if last else "لم يشغّل بعد"
-        status = "✅" if (not u.get("expires") or u["expires"] > now) else "❌"
-        lines.append(f"{status} <@{uid}> — **{runs}** مرة | آخر تشغيل: {last_str}")
-    e = discord.Embed(
-        title=f"▶️ إحصائيات التشغيل — {PROJECT_NAME}",
-        description="\n".join(lines),
-        color=BLUE,
-    )
-    e.set_footer(text=f"إجمالي التشغيل: {total_runs} | المشترين: {len(users)}")
-    await interaction.followup.send(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="genkeyfile", description="توليد مفاتيح كثيرة وتسليمها كملف .txt (للأونر)")
-@app_commands.describe(count="عدد المفاتيح (1-500)", days="مدة الصلاحية بالأيام (0 = مدى الحياة)")
-async def genkeyfile(interaction: discord.Interaction,
-                     count: app_commands.Range[int, 1, 500] = 10,
-                     days: app_commands.Range[int, 0, 3650] = 30):
-    if not is_owner(interaction.user):
-        await interaction.response.send_message("🔒 للأونر فقط.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    keys = []
-    for _ in range(count):
-        k = "-".join(secrets.token_hex(2).upper() for _ in range(3))
-        DATA["keys"][k] = {"days": days, "used_by": None}
-        keys.append(k)
-    await asyncio.to_thread(save)
-    duration_label = "مدى الحياة" if not days else str(days) + " يوم"
-    file_content = (
-        "# " + PROJECT_NAME + " — Keys\n"
-        "# المدة: " + duration_label + "\n"
-        "# التاريخ: " + str(int(time.time())) + "\n\n" +
-        "\n".join(keys)
-    ).encode("utf-8")
-    file = discord.File(
-        fp=__import__("io").BytesIO(file_content),
-        filename="keys_" + duration_label.replace(" ", "_") + "_" + str(count) + ".txt"
-    )
-    await interaction.followup.send(
-        "🔑 **" + str(count) + "** مفتاح (" + duration_label + ") — مرفق كملف.",
-        file=file,
-        ephemeral=True,
-    )
-    await notify_owners(
-        "🗝️ **genkeyfile**\nبواسطة: " + interaction.user.mention +
-        "\nالعدد: **" + str(count) + "** | المدة: " + duration_label
-    )
-
-
-if __name__ == "__main__":
-    Thread(target=lambda: _web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
-    bot.run(TOKEN)
+  end
+  local function hasGreenMark(root)
+    for _,d in ipairs(root:GetDescendants()) do
+      for _,c in ipairs(colorsOf(d)) do if isGreenColor(c) then return true end end
+    end
+    return false
+  end
+  local cache,at={},0
+  local function refresh()
+    local now=os.clock(); if now-at<0.6 then return end; at=now; cache={}
+    for _,p in ipairs(players:GetPlayers()) do
+      if p~=localPlayer then
+        local green=false
+        pcall(function()
+          if p.Team and isGreenColor(p.TeamColor.Color) then green=true end
+          local ch=p.Character
+          if not green and ch then
+            for _,d in ipairs(ch:GetDescendants()) do
+              if d:IsA("Highlight") or d:IsA("SelectionBox") then
+                for _,c in ipairs(colorsOf(d)) do if isGreenColor(c) then green=true end end
+              elseif d:IsA("BillboardGui") or d:IsA("SurfaceGui") then
+                if hasGreenMark(d) then green=true end
+              end
+              if green then break end
+            end
+          end
+        end)
+        cache[p]=green
+      end
+    end
+  end
+  isGreenTeammate=function(p) refresh(); return cache[p]==true end
+end
+
+local rayParams=RaycastParams.new()
+rayParams.FilterType=Enum.RaycastFilterType.Exclude
+local nextFilter=0
+local function refreshFilter()
+  local list={}
+  for _,p in ipairs(players:GetPlayers()) do if p.Character then table.insert(list,p.Character) end end
+  rayParams.FilterDescendantsInstances=list
+end
+local function blocked(from,to)
+  for _,yOff in ipairs({0,-2}) do
+    local o=Vector3.new(from.X,from.Y+yOff,from.Z)
+    local d=Vector3.new(to.X,from.Y+yOff,to.Z)-o
+    if d.Magnitude>0.5 then
+      local hit=workspace:Raycast(o,d,rayParams)
+      if hit and hit.Instance.CanCollide then return true end
+    end
+  end
+  return false
+end
+local function getAvoidDir(from,to,prefer)
+  local flat=Vector3.new(to.X-from.X,0,to.Z-from.Z)
+  if flat.Magnitude<0.5 then return flat,prefer end
+  local forward=flat.Unit
+  local function rot(rad)
+    return Vector3.new(forward.X*math.cos(rad)-forward.Z*math.sin(rad),0,
+      forward.X*math.sin(rad)+forward.Z*math.cos(rad))
+  end
+  local first=(prefer==-1) and -1 or 1
+  for _,deg in ipairs({30,60,90,120}) do
+    local rad=math.rad(deg)
+    local d1=rot(rad*first); if not blocked(from,from+d1*6) then return d1,first end
+    local d2=rot(-rad*first); if not blocked(from,from+d2*6) then return d2,-first end
+  end
+  return -forward,first
+end
+
+-- ══ محرك الحركة + human-like noise ══
+local D={pos=nil,untilT=0,owner=nil,avoid=nil,avoidUntil=0,side=nil,lastDir=nil}
+local function setDrive(pos,owner) D.pos=pos; D.untilT=os.clock()+0.2; D.owner=owner end
+local function clearDrive()
+  D.pos=nil; D.owner=nil; D.avoid=nil; D.avoidUntil=0; D.side=nil; D.lastDir=nil
+end
+
+--[[
+  HUM: حالة الـ humanizer
+  المبدأ:
+    1. دريفت زاوية — كل فريم نضيف offset زاوية يتغير بـ smoothed-random (مش sine ثابت)
+       الزاوية تتذبذب ±DRIFT_MAX راد/ثانية حول الاتجاه الحقيقي
+    2. micro-pause — كل PAUSE_INTERVAL±جيتر ثانية، نوقف hum:Move لـ PAUSE_DUR ثانية
+       يحاكي human input lag / لحظة تفكير
+    3. overshoot — كل OVERSHOOT_INTERVAL نمد الهدف شوي وبعدين نرجع
+       يحاكي لاعب يتجاوز الخصم ويصحح
+    4. سرعة الـ lerp للاتجاه تتغير عشوائياً (TURN_SPEED) — ما يلف بنفس السرعة دايماً
+]]
+local HUM = {
+  -- drift
+  driftAngle   = 0,          -- الزاوية الحالية (radians)
+  driftVel     = 0,          -- سرعة تغير الزاوية
+  DRIFT_MAX    = 0.38,       -- أقصى انحراف (راد) ≈ 22°
+  DRIFT_ACCEL  = 1.8,        -- تسارع العشوائية
+  DRIFT_DAMP   = 0.88,       -- تخميد (يمنع drift لا نهائي)
+  -- micro-pause
+  pauseUntil   = 0,
+  nextPause    = 0,
+  PAUSE_MIN    = 1.4,        -- أقل وقت بين pause وthانية
+  PAUSE_MAX    = 3.2,
+  PAUSE_DUR_MIN= 0.06,       -- مدة الـ pause
+  PAUSE_DUR_MAX= 0.18,
+  -- overshoot
+  overshootEnd = 0,
+  nextOvershoot= 0,
+  overshootOff = Vector3.zero,
+  OVER_MIN     = 2.5,
+  OVER_MAX     = 5.0,
+  OVER_DIST    = 1.8,        -- كم stud يتجاوز
+  -- turn speed jitter
+  turnSpeed    = 0.35,
+  nextTurnRoll = 0,
+}
+-- شيّل الـ pause و overshoot state لما يتغير الهدف أو يمسك اللاعب
+local function humReset()
+  HUM.driftAngle=0; HUM.driftVel=0
+  HUM.pauseUntil=0; HUM.nextPause=0
+  HUM.overshootEnd=0; HUM.nextOvershoot=0; HUM.overshootOff=Vector3.zero
+end
+
+-- pseudo-random بدون seed ثابت — يعيد قيمة [-1,1] متغيرة مع الوقت
+local function nrand(t,seed)
+  -- خليط من sinusoids بترددات غير متناسبة (غير دورية عملياً)
+  return math.sin(t*7.3+seed)*math.cos(t*3.17+seed*2.1)
+       + math.sin(t*13.9+seed*0.7)*0.4
+end
+
+local function humanizeDir(rawDir, dist, now)
+  local dt = 1/60   -- نفترض 60fps كـ cap (القيم صغيرة، لا يهم التفاوت)
+
+  -- 1. drift: نحرّك driftVel نحو target عشوائي، ونخمّده
+  local target = nrand(now, 3.14) * HUM.DRIFT_MAX
+  HUM.driftVel = HUM.driftVel + (target - HUM.driftAngle) * HUM.DRIFT_ACCEL * dt
+  HUM.driftVel = HUM.driftVel * HUM.DRIFT_DAMP
+  HUM.driftAngle = HUM.driftAngle + HUM.driftVel * dt
+  -- قرّب من الصفر كل ما اقتربنا من الهدف (ما نطير حوله)
+  local distFactor = math.clamp((dist - 2) / 8, 0, 1)
+  local angle = HUM.driftAngle * distFactor
+
+  -- دوران الاتجاه بزاوية drift
+  local cos_a, sin_a = math.cos(angle), math.sin(angle)
+  local driftedDir = Vector3.new(
+    rawDir.X * cos_a - rawDir.Z * sin_a,
+    0,
+    rawDir.X * sin_a + rawDir.Z * cos_a
+  )
+  if driftedDir.Magnitude > 0.01 then driftedDir = driftedDir.Unit end
+
+  -- 2. turn speed jitter — كل فترة نغير سرعة الـ lerp
+  if now >= HUM.nextTurnRoll then
+    HUM.turnSpeed = 0.22 + math.abs(nrand(now, 9.9)) * 0.28   -- 0.22 .. 0.50
+    HUM.nextTurnRoll = now + 0.4 + math.abs(nrand(now, 1.5)) * 0.6
+  end
+
+  return driftedDir
+end
+
+local function shouldPause(now)
+  -- إعداد أول pause
+  if HUM.nextPause == 0 then
+    HUM.nextPause = now + HUM.PAUSE_MIN + math.abs(nrand(now,7.7)) * (HUM.PAUSE_MAX - HUM.PAUSE_MIN)
+  end
+  if now < HUM.pauseUntil then return true end
+  if now >= HUM.nextPause then
+    local dur = HUM.PAUSE_DUR_MIN + math.abs(nrand(now,2.3)) * (HUM.PAUSE_DUR_MAX - HUM.PAUSE_DUR_MIN)
+    HUM.pauseUntil = now + dur
+    HUM.nextPause  = now + dur + HUM.PAUSE_MIN + math.abs(nrand(now,5.1)) * (HUM.PAUSE_MAX - HUM.PAUSE_MIN)
+    return true
+  end
+  return false
+end
+
+local function overshootOffset(rawDir, dist, now)
+  if now >= HUM.overshootEnd then HUM.overshootOff = Vector3.zero end
+  if HUM.nextOvershoot == 0 then
+    HUM.nextOvershoot = now + HUM.OVER_MIN + math.abs(nrand(now,4.4)) * (HUM.OVER_MAX - HUM.OVER_MIN)
+  end
+  if now >= HUM.nextOvershoot and dist < 5 then
+    -- قرب الهدف: نعطيه overshoot بسيط
+    local perpAngle = (nrand(now,8.8) > 0) and math.pi/2 or -math.pi/2
+    local cos_p, sin_p = math.cos(perpAngle), math.sin(perpAngle)
+    local perp = Vector3.new(rawDir.X*cos_p - rawDir.Z*sin_p, 0, rawDir.X*sin_p + rawDir.Z*cos_p)
+    HUM.overshootOff = perp * (HUM.OVER_DIST * (0.6 + math.abs(nrand(now,6.6))*0.4))
+    HUM.overshootEnd = now + 0.25 + math.abs(nrand(now,3.3))*0.2
+    HUM.nextOvershoot = now + HUM.OVER_MIN + math.abs(nrand(now,1.1))*(HUM.OVER_MAX-HUM.OVER_MIN)
+  end
+  return HUM.overshootOff
+end
+
+RunService:BindToRenderStep("AstaProDrive",Enum.RenderPriority.Input.Value+1,function()
+  local char=lp.Character
+  local hum=char and char:FindFirstChildOfClass("Humanoid")
+  local root=char and char:FindFirstChild("HumanoidRootPart")
+  if not hum or not root or hum.Health<=0 or root.Anchored then return end
+  if not D.pos or os.clock()>D.untilT then return end
+  if anyHeld() then humReset(); return end
+
+  local now = os.clock()
+
+  -- micro-pause: وقف قصير يحاكي human input lag
+  if shouldPause(now) then hum:Move(Vector3.zero,false); return end
+
+  local d=Vector3.new(D.pos.X-root.Position.X,0,D.pos.Z-root.Position.Z)
+  if d.Magnitude>1.2 then
+    local dist = d.Magnitude
+    local rawDir = d.Unit
+
+    -- overshoot offset (قرب الهدف فقط)
+    local over = overshootOffset(rawDir, dist, now)
+    local targetPos = D.pos + over
+
+    -- اتجاه نحو الهدف المعدّل
+    local td = Vector3.new(targetPos.X-root.Position.X, 0, targetPos.Z-root.Position.Z)
+    if td.Magnitude > 0.1 then rawDir = td.Unit end
+
+    -- wall avoidance
+    local myPos=root.Position; local dir=rawDir; local nowT=now
+    if D.avoid and nowT<D.avoidUntil then
+      if blocked(myPos,myPos+D.avoid*4) then D.avoid,D.side=getAvoidDir(myPos,D.pos,D.side); D.avoidUntil=nowT+0.5 end
+      dir=D.avoid
+    elseif blocked(myPos,myPos+rawDir*5) then
+      local avoid,side=getAvoidDir(myPos,D.pos,D.side)
+      D.avoid,D.side=avoid,side; D.avoidUntil=nowT+0.5; dir=avoid
+    else D.avoid=nil end
+
+    -- human drift على الاتجاه النهائي
+    dir = humanizeDir(dir, dist, now)
+
+    -- lerp بسرعة متغيرة
+    if D.lastDir and dir:Dot(D.lastDir)>-0.5 then
+      local sm=D.lastDir:Lerp(dir, HUM.turnSpeed)
+      if sm.Magnitude>0.01 then dir=sm.Unit end
+    end
+    D.lastDir=dir
+    hum:Move(dir,false)
+  else
+    humReset()
+    hum:Move(Vector3.zero,false)
+  end
+end)
+
+-- ══ اختيار الأهداف ══
+local function hasBomb(c) return findBomb(c)~=nil end
+local function validRoot(c)
+  local tr=c and c:FindFirstChild("HumanoidRootPart")
+  local th=c and c:FindFirstChildOfClass("Humanoid")
+  if tr and th and th.Health>0 then return tr end
+end
+local hudSeen=false
+local hudCache={t=0,v=false}
+local function reallyVisible(o)
+  local cur=o
+  while cur and cur~=game do
+    if cur:IsA("GuiObject") and not cur.Visible then return false end
+    if cur:IsA("ScreenGui") then return cur.Enabled end
+    cur=cur.Parent
+  end
+  return true
+end
+local function scoreHud()
+  local now=os.clock(); if now-hudCache.t<0.5 then return hudCache.v end
+  hudCache.t=now; local found=false
+  pcall(function()
+    local pg=lp:FindFirstChild("PlayerGui"); if not pg then return end
+    for _,d in ipairs(pg:GetDescendants()) do
+      if d:IsA("TextLabel") and #d.Text<=9 and d.Text:match("^%s*%d+%s*%-%s*%d+%s*$") and reallyVisible(d) then
+        found=true; break
+      end
+    end
+  end)
+  if found then hudSeen=true end; hudCache.v=found; return found
+end
+local function matchGate() if scoreHud() then return true end; return not hudSeen end
+local function matchOn(myChar,entries)
+  if scoreHud() then return true end; if hudSeen then return false end
+  if myChar and myChar:FindFirstChildOfClass("Tool") then return true end
+  for _,e in ipairs(entries) do
+    if e.Dist<=CFG.MATCH_RANGE and e.Root and e.Root.Parent and hasBomb(e.Root.Parent) then return true end
+  end
+  return false
+end
+local function pickTargets(root)
+  local nearest,nd=nil,CFG.MAX_RANGE; local bomb,bd=nil,CFG.MAX_RANGE
+  if #ST.locked>0 then
+    nd=math.huge
+    for i=#ST.locked,1,-1 do
+      local p=players:FindFirstChild(ST.locked[i])
+      if not p then table.remove(ST.locked,i)
+      else
+        local tr=validRoot(p.Character)
+        if tr then
+          local d=(root.Position-tr.Position).Magnitude
+          if d<nd then nd=d; nearest=tr end
+          if d<bd and hasBomb(p.Character) then bd=d; bomb=tr end
+        end
+      end
+    end
+    return nearest,nd,bomb,#ST.locked>0
+  end
+  for _,p in ipairs(players:GetPlayers()) do
+    if p~=lp and not isTeammate(p) and not isGreenTeammate(p) then
+      local tr=validRoot(p.Character)
+      if tr and not tr.Anchored and math.abs(tr.Position.Y-root.Position.Y)<=25 then
+        local d=(root.Position-tr.Position).Magnitude
+        if d<=CFG.MAX_RANGE then
+          if d<nd then nd=d; nearest=tr end
+          if d<bd and hasBomb(p.Character) then bd=d; bomb=tr end
+        end
+      end
+    end
+  end
+  return nearest,nd,bomb,false
+end
+local function pickGrabTarget(root)
+  if not matchGate() then return nil end
+  local holder,hd=nil,math.huge; local any,ad=nil,math.huge
+  local lockedMode=#ST.locked>0
+  local function consider(p)
+    local c=p.Character; local tr=validRoot(c); if not tr or tr.Anchored then return end
+    local d=(tr.Position-root.Position).Magnitude
+    if not lockedMode and (d>CFG.MATCH_RANGE or math.abs(tr.Position.Y-root.Position.Y)>12) then return end
+    if d<ad then ad=d; any=tr end
+    if d<hd and hasBomb(c) then hd=d; holder=tr end
+  end
+  if lockedMode then
+    for _,n in ipairs(ST.locked) do local p=players:FindFirstChild(n); if p then consider(p) end end
+  else
+    for _,p in ipairs(players:GetPlayers()) do
+      if p~=lp and not isTeammate(p) and not isGreenTeammate(p) then consider(p) end
+    end
+  end
+  if holder then return holder end
+  if lockedMode then return any end
+  if CFG.GRAB_FALLBACK_NEAREST then return any end
+  return nil
+end
+local function interceptPoint(me,tr,speed,vOverride)
+  local tp=tr.Position; local rv=tr.AssemblyLinearVelocity
+  local v=vOverride or Vector3.new(rv.X,0,rv.Z)
+  if v.Magnitude>80 then v=Vector3.zero end
+  if v.Magnitude<1.5 then return tp,true end
+  local t=(Vector3.new(tp.X-me.X,0,tp.Z-me.Z)).Magnitude/speed
+  for _=1,3 do
+    local pred=tp+v*math.min(t,0.9)
+    t=Vector3.new(pred.X-me.X,0,pred.Z-me.Z).Magnitude/speed
+  end
+  local off=v*math.min(t,0.9)
+  if off.Magnitude>12 then off=off.Unit*12 end
+  return tp+off,false
+end
+
+-- ══ الاسيست ══
+local A={holding=false,had=false,resumeAt=0,smooth=nil,lastSmooth=0,lastTr=nil}
+A.track=setmetatable({},{__mode="k"})
+local function assistReset() A.holding=false; A.had=false; A.smooth=nil; A.lastTr=nil end
+local function assistStep(char,hum,root,now)
+  local tr,_,bombRoot=pickTargets(root)
+  if not tr then if #ST.locked>0 then clearDrive(); return end; A.holding=false; clearDrive(); return end
+  if ST.grab and bombRoot then tr=bombRoot end
+  local tPos,me=tr.Position,root.Position
+  local dist=Vector3.new(tPos.X-me.X,0,tPos.Z-me.Z).Magnitude
+  if ST.grab and dist<=CFG.GRAB_RANGE and not root.Anchored then tryGrab(tr.Parent,tr,char,root) end
+  if not A.had then A.had=true; A.resumeAt=now+CFG.START_DELAY end
+  if now<A.resumeAt then A.holding=false; clearDrive(); return end
+  local eff_stop=math.min(CFG.STOP_DIST,CFG.ASSIST_RANGE)
+  if A.holding then if dist>eff_stop+CFG.RESUME_GAP then A.holding=false end
+  elseif dist<=eff_stop then A.holding=true end
+  if A.holding then clearDrive(); D.untilT=0; return end
+  local rv=tr.AssemblyLinearVelocity; local vel=Vector3.new(rv.X,0,rv.Z)
+  if vel.Magnitude>80 then vel=Vector3.zero end
+  local key=tr.Parent; local tk=A.track[key]
+  if not tk then tk={vel=vel,t=now,acc=Vector3.zero}; A.track[key]=tk end
+  local dtv=now-tk.t
+  if dtv>0.05 then tk.acc=tk.acc*0.6+((vel-tk.vel)/dtv)*0.4; tk.vel=vel; tk.t=now end
+  local acc=tk.acc; if acc.Magnitude>40 then acc=acc.Unit*40 end
+  local lead=math.clamp(dist/18,0,CFG.LEAD_MAX)
+  local off=vel*lead+acc*(0.5*lead*lead); if off.Magnitude>7 then off=off.Unit*7 end
+  local raw=tPos+off
+  local dtS=math.min(now-A.lastSmooth,0.1); A.lastSmooth=now
+  if not A.smooth or A.lastTr~=tr then A.smooth=raw
+  else A.smooth=A.smooth:Lerp(raw,math.clamp((CFG.ASSIST_POWER*0.1)*dtS,0,1)) end
+  A.lastTr=tr; setDrive(A.smooth,"assist")
+end
+
+-- ══ اوتو قراب ══
+local G={heldAt=0,smooth=nil,lastTr=nil,lastT=0}
+local function grabReset() G.smooth=nil; G.lastTr=nil; G.lastDir=nil; G.hist=nil; G.histTr=nil; G.lastLook=nil end
+local function turnRate(tr,now,st)
+  st=st or G; local rate,moveRate=0,0
+  local lv=tr.CFrame.LookVector; local lk=Vector3.new(lv.X,0,lv.Z)
+  if lk.Magnitude>0.01 then
+    lk=lk.Unit
+    if st.lastLook and st.lastLookT then
+      local dot=math.clamp(lk:Dot(st.lastLook),-1,1)
+      rate=math.acos(dot)/math.max(now-st.lastLookT,1/120)
+    end
+    st.lastLook=lk; st.lastLookT=now
+  end
+  local rv=tr.AssemblyLinearVelocity; local v=Vector3.new(rv.X,0,rv.Z)
+  if v.Magnitude>2 then
+    if st.lastDir and st.lastDirT then
+      local dot=math.clamp(v.Unit:Dot(st.lastDir),-1,1)
+      moveRate=math.acos(dot)/math.max(now-st.lastDirT,1/120)
+    end
+    st.lastDir=v.Unit; st.lastDirT=now
+  else st.lastDir=nil end
+  return math.max(rate,moveRate,math.abs(tr.AssemblyAngularVelocity.Y))
+end
+local function trackTarget(tr,now,st)
+  st=st or G
+  if st.histTr~=tr or not st.hist then st.hist={}; st.histTr=tr end
+  local h=st.hist; h[#h+1]={t=now,p=tr.Position}
+  while #h>2 and now-h[1].t>0.25 do table.remove(h,1) end
+  local first,last=h[1],h[#h]; local dtv=last.t-first.t
+  if dtv<0.04 then return Vector3.zero end
+  local v=(last.p-first.p)/dtv; return Vector3.new(v.X,0,v.Z)
+end
+local function grabStep(char,hum,root,now)
+  if anyHeld() then G.heldAt=now; grabReset(); clearDrive(); return end
+  if CFG.RELEASE_DELAY>0 and now-G.heldAt<CFG.RELEASE_DELAY then clearDrive(); return end
+  local tr=pickGrabTarget(root)
+  if not tr then grabReset(); clearDrive(); return end
+  local me,tp=root.Position,tr.Position
+  local dist=Vector3.new(tp.X-me.X,0,tp.Z-me.Z).Magnitude
+  local vel=trackTarget(tr,now)
+  local fast=turnRate(tr,now)>CFG.FAST_TURN
+  if dist<=CFG.GRAB_RANGE+(fast and 4 or 0) then tryGrab(tr.Parent,tr,char,root,fast and CFG.FAST_GRAB_CD or nil,fast) end
+  if dist<=1.3 then clearDrive(); return end
+  local pt,still=interceptPoint(me,tr,math.max(hum.WalkSpeed,10),vel)
+  local dt=math.min(now-G.lastT,0.1); G.lastT=now
+  if fast or still or not G.smooth or G.lastTr~=tr then G.smooth=pt
+  else G.smooth=G.smooth:Lerp(pt,math.clamp(9*dt,0,1)) end
+  G.lastTr=tr; setDrive(G.smooth,"grab")
+end
+
+-- ══ autoTrack ══
+local T={smooth=nil,lastTr=nil,lastT=0,holding=false}
+local function trackReset()
+  T.smooth=nil; T.lastTr=nil; T.holding=false
+  T.hist=nil; T.histTr=nil; T.lastDir=nil; T.lastLook=nil
+  T.prevVel=nil; T.prevT=nil; T.acc=nil
+end
+local function dropTrack() if D.owner=="track" then clearDrive() end end
+local function trackEntries(root)
+  local list={}
+  for _,p in ipairs(players:GetPlayers()) do
+    if p~=lp and not isTeammate(p) then
+      local tr=validRoot(p.Character)
+      if tr then list[#list+1]={Dist=(tr.Position-root.Position).Magnitude,Root=tr} end
+    end
+  end
+  return list
+end
+local function pickTrackTarget(root)
+  local lockedMode=#ST.locked>0
+  local best,bd=nil,lockedMode and math.huge or CFG.MATCH_RANGE
+  local function consider(p)
+    local tr=validRoot(p.Character); if not tr or tr.Anchored then return end
+    if not lockedMode and math.abs(tr.Position.Y-root.Position.Y)>12 then return end
+    local d=(tr.Position-root.Position).Magnitude; if d<bd then bd=d; best=tr end
+  end
+  if lockedMode then
+    for _,n in ipairs(ST.locked) do local p=players:FindFirstChild(n); if p then consider(p) end end
+  else
+    for _,p in ipairs(players:GetPlayers()) do
+      if p~=lp and not isTeammate(p) and not isGreenTeammate(p) then consider(p) end
+    end
+  end
+  return best
+end
+local function trackStep(char,hum,root,now)
+  if anyHeld() then trackReset(); dropTrack(); return end
+  local tr=pickTrackTarget(root); if not tr then trackReset(); dropTrack(); return end
+  local me,tp=root.Position,tr.Position
+  local dist=Vector3.new(tp.X-me.X,0,tp.Z-me.Z).Magnitude
+  local vel=trackTarget(tr,now,T); if vel.Magnitude>80 then vel=Vector3.zero end
+  local fast=turnRate(tr,now,T)>CFG.FAST_TURN
+  if dist<=CFG.GRAB_RANGE+(fast and 4 or 0) and not root.Anchored then
+    tryGrab(tr.Parent,tr,char,root,fast and CFG.FAST_GRAB_CD or nil,fast)
+  end
+  local eff_track=math.min(CFG.TRACK_DIST,CFG.ASSIST_RANGE)
+  if T.holding then if dist>eff_track+CFG.RESUME_GAP then T.holding=false end
+  elseif dist<=eff_track then T.holding=true end
+  if T.holding then dropTrack(); return end
+  local dtA=now-(T.prevT or now)
+  if not T.prevVel or T.lastTr~=tr or dtA>0.5 then
+    T.acc=Vector3.zero; T.prevVel=vel; T.prevT=now
+  elseif dtA>0.05 then
+    T.acc=(T.acc or Vector3.zero)*0.5+((vel-T.prevVel)/dtA)*0.5
+    T.prevVel=vel; T.prevT=now
+  end
+  local acc=T.acc or Vector3.zero; if acc.Magnitude>40 then acc=acc.Unit*40 end
+  local speed=math.max(hum.WalkSpeed,10)
+  local lead=math.clamp(dist/speed,0,CFG.LEAD_MAX*1.5)
+  local off=vel*lead+acc*(0.5*lead*lead); if off.Magnitude>9 then off=off.Unit*9 end
+  local blend=math.clamp((dist-3)/8,0,1); local aim=tp+off*blend
+  local dt=math.min(now-T.lastT,0.1); T.lastT=now; local still=vel.Magnitude<1.5
+  if fast or still or not T.smooth or T.lastTr~=tr then T.smooth=aim
+  else T.smooth=T.smooth:Lerp(aim,math.clamp((CFG.ASSIST_POWER*0.15)*dt,0,1)) end
+  T.lastTr=tr; setDrive(T.smooth,"track")
+end
+
+-- ══════════════════════════════════════════════
+--  ★ ESP — هايلايت الأعداء
+-- ══════════════════════════════════════════════
+local espHandles = {}   -- [player] = Highlight instance
+
+local function espApply(p)
+  if p == localPlayer then return end
+  local ch = p.Character
+  if not ch then return end
+  local existing = ch:FindFirstChild("__AstaESP")
+  if existing then return end
+  local h = Instance.new("Highlight")
+  h.Name        = "__AstaESP"
+  h.FillColor   = Color3.fromRGB(220,50,50)
+  h.OutlineColor= Color3.fromRGB(255,80,80)
+  h.FillTransparency   = 0.55
+  h.OutlineTransparency= 0.0
+  h.DepthMode   = Enum.HighlightDepthMode.AlwaysOnTop
+  h.Parent      = ch
+  espHandles[p] = h
+  -- بيلبورد المسافة فوق الرأس
+  local bb = Instance.new("BillboardGui")
+  bb.Name = "__AstaESP_bb"
+  bb.Size = UDim2.fromOffset(120,30)
+  bb.StudsOffset = Vector3.new(0,3.5,0)
+  bb.AlwaysOnTop = true
+  local root = ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("UpperTorso") or ch.PrimaryPart
+  if root then bb.Adornee = root end
+  bb.Parent = ch
+  local lbl = Instance.new("TextLabel",bb)
+  lbl.Size = UDim2.fromScale(1,1)
+  lbl.BackgroundTransparency = 1
+  lbl.TextColor3 = Color3.fromRGB(255,255,255)
+  lbl.TextStrokeColor3 = Color3.fromRGB(0,0,0)
+  lbl.TextStrokeTransparency = 0.3
+  lbl.TextSize = 14
+  lbl.Font = Enum.Font.GothamBold
+  lbl.Text = p.DisplayName
+  -- نحدّث المسافة كل فريم
+  keep(RunService.Heartbeat:Connect(function()
+    if not ST.esp or not bb.Parent or not ch.Parent then return end
+    local myRoot = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+    local hisRoot = ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("UpperTorso")
+    if myRoot and hisRoot then
+      local d = math.floor((myRoot.Position-hisRoot.Position).Magnitude)
+      lbl.Text = p.DisplayName .. "\n" .. d .. "m"
+    end
+  end))
+end
+
+local function espClear(p)
+  local h = espHandles[p]
+  if h then pcall(function() h:Destroy() end) end
+  espHandles[p] = nil
+  if p.Character then
+    local bb = p.Character:FindFirstChild("__AstaESP_bb")
+    if bb then pcall(function() bb:Destroy() end) end
+  end
+end
+
+local function espRefresh()
+  if not ST.esp then
+    for p in pairs(espHandles) do espClear(p) end
+    return
+  end
+  for _,p in ipairs(Players:GetPlayers()) do
+    if p ~= localPlayer and not isTeammate(p) and not isGreenTeammate(p) then
+      if not espHandles[p] then espApply(p) end
+    else
+      espClear(p)
+    end
+  end
+  -- نظّف المغادرين
+  for p in pairs(espHandles) do
+    if not p.Parent then espClear(p) end
+  end
+end
+
+keep(Players.PlayerAdded:Connect(function(p)
+  p.CharacterAdded:Connect(function()
+    task.wait(0.5); if ST.esp then espApply(p) end
+  end)
+end))
+keep(Players.PlayerRemoving:Connect(function(p) espClear(p) end))
+
+-- ══════════════════════════════════════════════
+--  ★ Speed Boost
+-- ══════════════════════════════════════════════
+local function applySpeed()
+  local ch = lp.Character; local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+  if not hum then return end
+  if not _G.__asta_base_speed then _G.__asta_base_speed = hum.WalkSpeed end
+  hum.WalkSpeed = ST.speed and (_G.__asta_base_speed + CFG.SPEED_BONUS) or _G.__asta_base_speed
+end
+
+keep(lp.CharacterAdded:Connect(function(ch)
+  _G.__asta_base_speed = nil
+  ch:WaitForChild("Humanoid",10)
+  task.wait(0.5); applySpeed()
+end))
+
+-- ══════════════════════════════════════════════
+--  ★ AutoJump — يجمب لما يكشف جدار قدامك
+-- ══════════════════════════════════════════════
+local ajParams = RaycastParams.new()
+ajParams.FilterType = Enum.RaycastFilterType.Exclude
+local lastJump = 0
+
+local function autoJumpStep(char,hum,root)
+  if not ST.autojump then return end
+  if anyHeld() then return end   -- لو اللاعب يلعب بنفسه: لا تتدخل
+  if os.clock() - lastJump < 0.5 then return end
+  local lv = root.CFrame.LookVector
+  local dir = Vector3.new(lv.X,0,lv.Z)
+  if dir.Magnitude < 0.01 then return end
+  dir = dir.Unit
+  local origin = root.Position + Vector3.new(0,-1.5,0)
+  local ch2 = {}
+  for _,p in ipairs(Players:GetPlayers()) do if p.Character then ch2[#ch2+1]=p.Character end end
+  ajParams.FilterDescendantsInstances = ch2
+  local hit = workspace:Raycast(origin, dir * CFG.JUMP_CHECK_DIST, ajParams)
+  if hit and hit.Instance.CanCollide then
+    -- جدار قدامنا: نجمب
+    local gr = workspace:Raycast(root.Position, Vector3.new(0,-3,0), ajParams)
+    if gr then   -- نتأكد إنا على الأرض
+      hum.Jump = true
+      lastJump = os.clock()
+    end
+  end
+end
+
+-- ══ الحلقة الرئيسية ══
+local nextFilterAt=0
+keep(RunService.Heartbeat:Connect(function()
+  if not alive() then return end
+  local now=os.clock()
+  local char=lp.Character; local hum=char and char:FindFirstChildOfClass("Humanoid")
+  local root=char and char:FindFirstChild("HumanoidRootPart")
+  if not hum or not root or hum.Health<=0 then clearDrive(); return end
+  if root.Anchored then clearDrive(); assistReset(); grabReset(); return end
+  if now>=nextFilterAt then nextFilterAt=now+1; pcall(refreshFilter) end
+
+  -- ★ ميزات جديدة
+  pcall(autoJumpStep,char,hum,root)
+
+  local hasTool=false
+  for _,it in ipairs(char:GetChildren()) do if it:IsA("Tool") then hasTool=true; break end end
+
+  if hasTool then
+    grabReset()
+    if ST.track then assistReset(); trackStep(char,hum,root,now)
+    elseif ST.assist then trackReset(); assistStep(char,hum,root,now)
+    else assistReset(); trackReset(); clearDrive() end
+  else
+    assistReset(); trackReset()
+    if ST.grab then grabStep(char,hum,root,now) else clearDrive() end
+  end
+end))
+
+-- ESP refresh loop
+task.spawn(function()
+  while alive() do task.wait(1); pcall(espRefresh) end
+end)
+
+-- Speed reapply on char change
+task.spawn(function()
+  while alive() do task.wait(2); pcall(applySpeed) end
+end)
+
+-- ══════════════════════════════════════════════
+--  الواجهة (فاخرة — dark glass + neon blue/gold)
+-- ══════════════════════════════════════════════
+local UI = {}
+do
+  local C = {
+    bg       = Color3.fromRGB(8,  10, 18),
+    card     = Color3.fromRGB(18, 22, 38),
+    card2    = Color3.fromRGB(24, 28, 50),
+    off      = Color3.fromRGB(44, 48, 72),
+    border   = Color3.fromRGB(55, 65, 110),
+    neon     = Color3.fromRGB(80, 160, 255),
+    neon2    = Color3.fromRGB(50, 110, 220),
+    gold     = Color3.fromRGB(255, 200, 60),
+    gold2    = Color3.fromRGB(200, 140, 20),
+    red      = Color3.fromRGB(220, 50,  50),
+    green    = Color3.fromRGB(60,  210, 110),
+    text     = Color3.fromRGB(230, 235, 255),
+    dim      = Color3.fromRGB(120, 130, 1
